@@ -1,0 +1,25 @@
+[Unit]
+Description=Go Sub-Aggregator Service
+After=network-online.target mysql.service x-ui.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sub_aggregator
+ExecStart=/opt/sub_aggregator/sub_aggregator_go_bin
+Restart=always
+RestartSec=3
+
+# مقادیر حساس را اینجا (یا با systemctl edit sub_aggregator_go) قرار دهید،
+# نه داخل کد. اگر MySQL یا اطلاعات دیگر با پیش‌فرض‌های main.go فرق دارد،
+# این خط‌ها را باز کرده و مقداردهی کنید:
+# Environment="MYSQL_USER=Admin"
+# Environment="MYSQL_PASS=your-real-password"
+# Environment="MYSQL_DB=mirzaprobot"
+# Environment="MYSQL_HOST=127.0.0.1:3306"
+# Environment="SANAEI_DB_PATH=/etc/x-ui/x-ui.db"
+# Environment="SUB_AGG_FETCH_INTERVAL_MINUTES=60"
+
+[Install]
+WantedBy=multi-user.target

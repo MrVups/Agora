@@ -1,0 +1,18 @@
+# Local/runtime data
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Local build outputs
+sub_aggregator_go_bin
+sub_aggregator_go_linux_amd64
+sub_aggregator_go_linux_arm64
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime state accidentally copied from a server
+panel-manager.state

@@ -1,0 +1,65 @@
+name: Build and Release
+
+# Runs on every version tag (e.g. v1.0.0) and builds ready-to-run binaries
+# published as GitHub Release assets, so target servers never need Go or a
+# C compiler installed locally.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Pinned to 22.04 on purpose: a CGO binary is dynamically linked against
+    # the build machine's glibc. Building on a newer Ubuntu than the target
+    # server can produce a binary that fails at runtime with
+    # "GLIBC_2.3x not found" on an older server (e.g. Ubuntu 22.04, which is
+    # what this project has actually been deployed and tested on). Pinning
+    # to 22.04 keeps the binary compatible with 22.04+ targets.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build (linux/amd64, CGO enabled for sqlite3)
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go mod download
+          go build -ldflags="-s -w" -o sub_aggregator_go_linux_amd64 main.go
+
+      - name: Smoke-test the amd64 binary
+        run: |
+          ./sub_aggregator_go_linux_amd64 version
+          file sub_aggregator_go_linux_amd64 | grep -q "dynamically linked"
+
+      - name: Build (linux/arm64, CGO enabled for sqlite3)
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: arm64
+          CC: aarch64-linux-gnu-gcc
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          go build -ldflags="-s -w" -o sub_aggregator_go_linux_arm64 main.go
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sub_aggregator_go_linux_amd64
+            sub_aggregator_go_linux_arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

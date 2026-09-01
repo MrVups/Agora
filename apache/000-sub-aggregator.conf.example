@@ -1,0 +1,23 @@
+# این فایل را در /etc/apache2/sites-available/ کپی کنید (مثلاً با نام
+# 000-news_go.conf)، دامنه و مسیر گواهی را با مقادیر واقعی خودتان جایگزین
+# کنید، و با دستور زیر فعالش کنید:
+#   a2ensite 000-news_go
+#   systemctl reload apache2
+#
+# پیش‌نیاز: ماژول proxy و proxy_http آپاچی باید فعال باشند:
+#   a2enmod proxy proxy_http
+#
+# نکته: چون سرویس Go از طریق Unix Socket کار می‌کند (نه پورت TCP)، هیچ‌وقت
+# با پورت‌های اینباند x-ui یا هر سرویس دیگری روی این سرور تداخل پیدا نمی‌کند.
+
+<VirtualHost *:443>
+    ServerName YOUR_DOMAIN_HERE
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/sub_aggregator/fullchain.pem
+    SSLCertificateKeyFile /etc/ssl/sub_aggregator/privkey.pem
+
+    ProxyPreserveHost On
+    ProxyPass / unix:/run/sub_aggregator/aggregator.sock|http://localhost/
+    ProxyPassReverse / unix:/run/sub_aggregator/aggregator.sock|http://localhost/
+</VirtualHost>
