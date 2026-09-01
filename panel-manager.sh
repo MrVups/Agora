@@ -511,8 +511,8 @@ setup_domain_and_cert() {
       info "Installing certbot..."
       apt-get update -y && apt-get install -y certbot python3-certbot-apache
     fi
-    certbot certonly --apache -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --register-unsafely-without-email || \
-      certbot certonly --apache -d "$domain" || {
+    certbot certonly --apache -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --register-unsafely-without-email >&2 || \
+      certbot certonly --apache -d "$domain" >&2 || {
         err "Certificate issuance failed."
         return 1
       }
