@@ -49,26 +49,16 @@ var (
 	LISTEN_PORT    = envOrDefault("SUB_AGG_LISTEN_PORT", ":8443")
 
 	// ---- تنظیمات مربوط به پشتیبانی چندپنلی ----
-	// اگر PANEL_TYPE صریحاً ست شده باشد همان استفاده می‌شود؛ در غیر این صورت
-	// در ابتدای اجرا با detectPanelType() به‌صورت خودکار تشخیص داده می‌شود.
 	PANEL_TYPE            = os.Getenv("PANEL_TYPE")
 	PASARGUARD_PORT       = envOrDefault("PASARGUARD_PORT", "8000")
-	PASARGUARD_SUB_PATH   = envOrDefault("PASARGUARD_SUB_PATH", "/sub/") // باید دقیقاً با XRAY_SUBSCRIPTION_PATH/SUBSCRIPTION_PATH پنل یکی باشد
-	PASARGUARD_SCHEME     = envOrDefault("PASARGUARD_SCHEME", "http")    // پیش‌فرض پاسارگارد HTTP داخلی است، نه HTTPS مثل x-ui
-	PASARGUARD_ADMIN_USER = os.Getenv("PASARGUARD_ADMIN_USER")           // اختیاری؛ فقط برای نمایش لیست گروه‌ها در کنسول لازم است
+	PASARGUARD_SUB_PATH   = envOrDefault("PASARGUARD_SUB_PATH", "/sub/") 
+	PASARGUARD_SCHEME     = envOrDefault("PASARGUARD_SCHEME", "http")    
+	PASARGUARD_ADMIN_USER = os.Getenv("PASARGUARD_ADMIN_USER")           
 	PASARGUARD_ADMIN_PASS = os.Getenv("PASARGUARD_ADMIN_PASS")
 
-	// فرمت مقداری که در ستون product.inbounds نوشته می‌شود:
-	//   "plain"      → همان عدد خام، مثلاً "2"      (فرمت مورد نیاز ربات Faoxima برای پنل x-ui؛ intval() می‌خواند)
-	//   "json_array" → آرایه‌ی JSON، مثلاً "[2]"    (فرمت مورد نیاز ربات میرزای قدیمی / محصولات نوع مرزبان در Faoxima)
 	BOT_INBOUND_FORMAT = envOrDefault("BOT_INBOUND_FORMAT", "plain")
 )
 
-// detectPanelType وقتی PANEL_TYPE صریحاً تنظیم نشده باشد، نوع پنل نصب‌شده
-// روی سرور را خودکار تشخیص می‌دهد:
-//  1. اگر فایل x-ui.db موجود باشد → xui (مسیر نصب x-ui همیشه ثابت است)
-//  2. وگرنه پورت پیش‌فرض پاسارگارد را پروب می‌کند
-//  3. اگر هیچ‌کدام پیدا نشد → پیش‌فرض ایمن xui با هشدار
 func detectPanelType() string {
 	if PANEL_TYPE != "" {
 		log.Printf("🧩 نوع پنل صریحاً از تنظیمات خوانده شد: %s", PANEL_TYPE)
@@ -88,7 +78,7 @@ func detectPanelType() string {
 		return "pasarguard"
 	}
 
-	log.Printf("⚠️  نتوانستم نوع پنل را خودکار تشخیص بدهم (نه x-ui.db پیدا شد، نه پورت %s پاسخ داد). پیش‌فرض xui در نظر گرفته می‌شود؛ برای اطمینان PANEL_TYPE را صریح تنظیم کنید.", PASARGUARD_PORT)
+	log.Printf("⚠️  نتوانستم نوع پنل را خودکار تشخیص بدهم. پیش‌فرض xui در نظر گرفته می‌شود.")
 	return "xui"
 }
 
@@ -195,9 +185,6 @@ func getXUIConfig() XUIRuntimeConfig {
 	return v.(XUIRuntimeConfig)
 }
 
-// loadXUIRuntimeConfig مسیر و پورت واقعی سرویس ساب‌اسکریپشن را مستقیم از
-// دیتابیس x-ui می‌خواند (کلیدهای subPath و subPort در جدول settings)، تا اگر
-// ادمین از پنل این مقادیر را عوض کند، نیازی به تغییر دستی کد یا ری‌استارت نباشد.
 func loadXUIRuntimeConfig() {
 	cfg := XUIRuntimeConfig{Path: "/sub/", Port: SANAEI_PORT, Domain: ""}
 	if xuiDB != nil {
@@ -225,13 +212,13 @@ func loadXUIRuntimeConfig() {
 			}
 			rows.Close()
 		} else {
-			log.Printf("⚠️  خواندن تنظیمات subPath/subPort/subDomain از x-ui.db ناموفق بود: %v", err)
+			log.Printf("⚠️  خواندن تنظیمات از x-ui.db ناموفق بود: %v", err)
 		}
 	}
 
 	old := getXUIConfig()
 	if old.Path != cfg.Path || old.Port != cfg.Port || old.Domain != cfg.Domain {
-		log.Printf("🔄 تنظیمات ساب‌اسکریپشن x-ui: Path=%s Port=%s Domain=%s (قبلی: Path=%s Port=%s Domain=%s)", cfg.Path, cfg.Port, cfg.Domain, old.Path, old.Port, old.Domain)
+		log.Printf("🔄 تنظیمات ساب‌اسکریپشن x-ui: Path=%s Port=%s Domain=%s", cfg.Path, cfg.Port, cfg.Domain)
 	}
 	xuiConfigVal.Store(cfg)
 }
@@ -248,30 +235,8 @@ func initMySQLDB() {
 	mysqlDB.SetMaxOpenConns(3)
 	mysqlDB.SetConnMaxLifetime(5 * time.Minute)
 	if err := mysqlDB.Ping(); err != nil {
-		log.Printf("⚠️  Ping اولیه به MySQL ناموفق بود: %v (تلاش خودکار در کوئری‌های بعدی)", err)
-		// عمداً mysqlDB را nil نمی‌کنیم؛ اگر MySQL بعداً بالا بیاید (مثلاً به‌خاطر
-		// ترتیب متفاوت استارت سرویس‌ها هنگام بوت)، کوئری‌های بعدی خودشان دوباره وصل می‌شوند.
+		log.Printf("⚠️  Ping اولیه به MySQL ناموفق بود: %v", err)
 	}
-}
-
-func findSSLCerts() (string, string) {
-	acmeDir := "/root/.acme.sh"
-	files, err := os.ReadDir(acmeDir)
-	if err == nil {
-		for _, f := range files {
-			if f.IsDir() && strings.HasSuffix(f.Name(), "_ecc") {
-				cert := filepath.Join(acmeDir, f.Name(), "fullchain.cer")
-				domain := strings.TrimSuffix(f.Name(), "_ecc")
-				key := filepath.Join(acmeDir, f.Name(), domain+".key")
-				if _, err1 := os.Stat(cert); err1 == nil {
-					if _, err2 := os.Stat(key); err2 == nil {
-						return cert, key
-					}
-				}
-			}
-		}
-	}
-	return "", ""
 }
 
 func isInfoOrFakeConfig(line string) bool {
@@ -511,7 +476,6 @@ func getCachedConfigsForInbound(inboundID int) []string {
 	return out
 }
 
-// normalizeURIPath یک مسیر URI را طوری می‌کند که هم با / شروع شود هم با / تمام شود.
 func normalizeURIPath(v string) string {
 	if v == "" {
 		return "/"
@@ -525,10 +489,10 @@ func normalizeURIPath(v string) string {
 	return v
 }
 
-// isV2rayUserAgent تشخیص می‌دهد آیا درخواست از یک کلاینت VPN (نه مرورگر) آمده.
+// 📌 پچ ۱: اضافه شدن کلاینت happ به لیست مجاز
 func isV2rayUserAgent(userAgent string) bool {
 	ua := strings.ToLower(userAgent)
-	for _, c := range []string{"v2ray", "ng", "sing-box", "clash", "shadowrocket", "streisand", "karing", "neko", "hiddify"} {
+	for _, c := range []string{"v2ray", "ng", "sing-box", "clash", "shadowrocket", "streisand", "karing", "neko", "hiddify", "happ"} {
 		if strings.Contains(ua, c) {
 			return true
 		}
@@ -536,11 +500,47 @@ func isV2rayUserAgent(userAgent string) bool {
 	return false
 }
 
-// getCachedConfigsForGroups مثل getCachedConfigsForInbound است، با این تفاوت که
-// یک کاربر پاسارگارد می‌تواند هم‌زمان عضو چند گروه باشد.
+// 📌 پچ ۳: تابع انتقال هدرهای متادیتا به سمت کاربر
+func copySubscriptionHeaders(dst, src http.Header) {
+	for _, key := range []string{
+		"Subscription-Userinfo",
+		"Profile-Title",
+		"Profile-Update-Interval",
+		"Support-Url",
+		"Content-Disposition",
+	} {
+		if values := src.Values(key); len(values) > 0 {
+			dst.Del(key)
+			for _, value := range values {
+				dst.Add(key, value)
+			}
+		}
+	}
+}
+
+// 📌 پچ ۴: لاگر امن برای دیباگ خروجی ارسالی به کلاینت
+func debugSubscriptionResponse(tag string, r *http.Request, resp *http.Response, body []byte) {
+	if os.Getenv("SUB_AGG_DEBUG") != "1" {
+		return
+	}
+	isBase64 := "false"
+	if _, ok := decodeBase64(string(body)); ok {
+		isBase64 = "true"
+	}
+	log.Printf(
+		"[SUB-DEBUG][%s] UA=%q Status=%d Content-Type=%q BodyLen=%d Base64=%s",
+		tag,
+		r.Header.Get("User-Agent"),
+		resp.StatusCode,
+		resp.Header.Get("Content-Type"),
+		len(body),
+		isBase64,
+	)
+}
+
 func getCachedConfigsForGroups(groupIDs []int) []string {
 	if len(groupIDs) == 0 {
-		return getCachedConfigsForInbound(-1) // فقط 'all' را برمی‌گرداند
+		return getCachedConfigsForInbound(-1)
 	}
 	placeholders := make([]string, 0, len(groupIDs)+1)
 	args := make([]interface{}, 0, len(groupIDs)+1)
@@ -567,15 +567,6 @@ func getCachedConfigsForGroups(groupIDs []int) []string {
 	return out
 }
 
-// ------------------------------------------------------------------
-// پشتیبانی از پنل PasarGuard (به‌جای x-ui)
-// PasarGuard برخلاف x-ui فایل دیتابیس یکسانی برای خواندن مستقیم ندارد؛
-// در عوض یک REST API رسمی دارد. خوشبختانه endpointهای زیر بدون نیاز به
-// لاگین ادمین و فقط با داشتن توکن ساب‌اسکریپشن کاربر در دسترس‌اند:
-//   GET {path}/{token}/info  → اطلاعات کاربر شامل group_ids
-//   GET {path}/{token}       → محتوای اصلی ساب‌اسکریپشن (همان چیزی که کاربر می‌بیند)
-// ------------------------------------------------------------------
-
 type pasarGuardUserInfo struct {
 	GroupIDs  []int  `json:"group_ids"`
 	CreatedAt string `json:"created_at"`
@@ -596,14 +587,12 @@ func fetchPasarGuardUserInfo(token string) *pasarGuardUserInfo {
 	body, _ := io.ReadAll(resp.Body)
 	var info pasarGuardUserInfo
 	if err := json.Unmarshal(body, &info); err != nil {
-		log.Printf("[PasarGuard] خطا در تجزیه‌ی JSON اطلاعات کاربر: %v", err)
+		log.Printf("[PasarGuard] خطا در تجزیه‌ی JSON: %v", err)
 		return nil
 	}
 	return &info
 }
 
-// gregorianToJalali تاریخ میلادی را به شمسی تبدیل می‌کند (الگوریتم استاندارد،
-// بدون نیاز به کتابخانه‌ی خارجی — برای اینکه go.sum و بیلد پیچیده‌تر نشود).
 func gregorianToJalali(gy, gm, gd int) (int, int, int) {
 	gDaysInMonth := []int{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
 	var jy int
@@ -640,11 +629,6 @@ func gregorianToJalali(gy, gm, gd int) (int, int, int) {
 	return jy, jm, jd
 }
 
-// jalaliDayOfPurchase تاریخ ساخت اکانت کاربر (created_at، که در پاسارگارد
-// همان لحظه‌ی خرید/صدور اکانت است) را می‌گیرد و روز ماه شمسی را برمی‌گرداند
-// (بین ۱ تا ۳۱). این کاملاً مستقل از Group واقعی پاسارگارد است — یعنی
-// دسترسی به Host های واقعی VPN دست‌نخورده می‌ماند و فقط تعیین می‌کند کدام
-// دسته از لینک‌های مادرِ ثبت‌شده در کنسول به این کاربر اضافه شود.
 func jalaliDayOfPurchase(createdAt string) int {
 	if createdAt == "" {
 		return 0
@@ -661,11 +645,9 @@ func jalaliDayOfPurchase(createdAt string) int {
 	return jd
 }
 
-// getCachedConfigsForDay کانفیگ‌های مادر ثبت‌شده برای یک روز مشخص شمسی
-// (یا 'all') را برمی‌گرداند.
 func getCachedConfigsForDay(day int) []string {
 	if day <= 0 {
-		return getCachedConfigsForInbound(-1) // فقط 'all'
+		return getCachedConfigsForInbound(-1)
 	}
 	rows, err := db.Query("SELECT raw_config FROM cached_configs WHERE inbound_id = ? OR inbound_id = 'all'", strconv.Itoa(day))
 	if err != nil {
@@ -682,11 +664,6 @@ func getCachedConfigsForDay(day int) []string {
 	return out
 }
 
-// injectExtraIntoPasarGuardHTML کانفیگ‌های اضافه را داخل قالب رندرشده‌ی
-// صفحه‌ی ساب‌اسکریپشن پاسارگارد (Jinja2 → HTML خام) تزریق می‌کند. الگوی
-// دقیق هر لینک (div.link-item شامل input + دو دکمه) از سورس رسمی پاسارگارد
-// (app/templates/subscription/index.html) کپی شده تا با CSS/JS موجود صفحه
-// (از جمله دکمه‌ی «Copy All Links» و تولید QR Code) سازگار بماند.
 func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string {
 	if len(extraConfigs) == 0 {
 		return htmlStr
@@ -738,11 +715,15 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 	defer resp.Body.Close()
-	bodyBytes, _ := io.ReadAll(resp.Body)
 
-	// اگر پاسارگارد خودش خطا داده (توکن نامعتبر/منقضی و غیره)، همان خطا را
-	// عیناً برمی‌گردانیم و ادامه نمی‌دهیم — تا کش عمومی 'all' اشتباهی به‌جای
-	// پیام خطا نمایش داده نشود.
+	// 📌 پچ ۳: انتقال هدرها
+	copySubscriptionHeaders(w.Header(), resp.Header)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	
+	// 📌 پچ ۴: لاگر امن
+	debugSubscriptionResponse("PasarGuard", r, resp, bodyBytes)
+
 	if resp.StatusCode != 200 {
 		ct := resp.Header.Get("Content-Type")
 		if ct == "" {
@@ -792,20 +773,15 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
+	
+	// 📌 پچ ۲: استفاده از StdEncoding برای پدینگ استاندارد در Base64
 	if isBase64 {
-		encodedFinal := base64.RawStdEncoding.EncodeToString([]byte(allConfigs))
+		encodedFinal := base64.StdEncoding.EncodeToString([]byte(allConfigs))
 		w.Write([]byte(encodedFinal))
 		return
 	}
 	w.Write([]byte(allConfigs))
 }
-
-// ------------------------------------------------------------------
-// لاگین ادمین و کش توکن JWT پاسارگارد — فقط برای نمایش لیست گروه‌ها در
-// کنسول لازم است (مسیر اصلی سرو کردن ساب‌اسکریپشن اصلاً به این نیاز ندارد).
-// اگر PASARGUARD_ADMIN_USER/PASS تنظیم نشده باشد، این قابلیت به‌آرامی
-// غیرفعال می‌ماند و کنسول به‌جای دراپ‌داون، ورودی متنی ساده نشان می‌دهد.
-// ------------------------------------------------------------------
 
 type pgGroupSimple struct {
 	ID   int    `json:"id"`
@@ -854,14 +830,10 @@ func getPasarGuardAdminToken(forceRefresh bool) string {
 		return ""
 	}
 	pgTokenCache = tok.AccessToken
-	// طول عمر توکن پیش‌فرض پاسارگارد ۲۴ ساعته است؛ برای اطمینان کمی زودتر رفرش می‌کنیم.
 	pgTokenExpires = time.Now().Add(20 * time.Hour)
 	return pgTokenCache
 }
 
-// getPasarGuardGroups لیست سبک (id, name) همه‌ی گروه‌ها را برمی‌گرداند؛
-// برای پر کردن دراپ‌داون کنسول استفاده می‌شود. اگر credential ادمین تنظیم
-// نشده یا خطا رخ دهد، فقط nil برمی‌گرداند (کنسول fallback می‌کند).
 func getPasarGuardGroups() []pgGroupSimple {
 	token := getPasarGuardAdminToken(false)
 	if token == "" {
@@ -882,7 +854,6 @@ func getPasarGuardGroups() []pgGroupSimple {
 		return nil
 	}
 	if resp.StatusCode == 401 {
-		// توکن احتمالاً منقضی/باطل شده؛ یک‌بار با توکن تازه دوباره تلاش می‌کنیم.
 		resp.Body.Close()
 		token = getPasarGuardAdminToken(true)
 		if token == "" {
@@ -1053,7 +1024,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
     <option value="all">همه (all)</option>
     {{range $d := .DayOptions}}<option value="{{$d}}">روز {{$d}} شمسی</option>{{end}}
   </select>
-  <small class="text-muted">بر اساس روز شمسی ساخت اکانت کاربر (created_at در پاسارگارد) انتخاب می‌شود — نه گروه واقعی.</small>
+  <small class="text-muted">بر اساس روز شمسی ساخت اکانت کاربر انتخاب می‌شود.</small>
 {{else}}
   <input type="text" name="target_inbounds" class="form-control" value="all" required placeholder="Inbound ID یا all">
 {{end}}
@@ -1300,8 +1271,6 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "خطا در پردازش رمز عبور", http.StatusInternalServerError)
 			return
 		}
-		// تراکنش اتمیک: اگر بین DELETE و INSERT سرویس قطع بشه، جدول
-		// admin_users خالی نمی‌مونه (که یعنی قفل کامل شدن کنسول ادمین).
 		tx, err := db.Begin()
 		if err != nil {
 			http.Error(w, "خطا در دیتابیس", http.StatusInternalServerError)
@@ -1407,13 +1376,7 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	for k, v := range r.Header {
 		req.Header[k] = v
 	}
-	// صراحتاً درخواست بدون فشرده‌سازی می‌کنیم تا مطمئن باشیم بایت‌های خام HTML را
-	// می‌بینیم (نه gzip)، چون منطق تزریق کانفیگ روی متن خام رشته جستجو می‌کند.
 	req.Header.Set("Accept-Encoding", "identity")
-	// x-ui وقتی Listen Domain تنظیم شده باشد، فقط درخواست‌هایی با هدر Host
-	// دقیقاً برابر همان دامنه را می‌پذیرد؛ چون این درخواست از سمت لوکال‌هاست
-	// ساخته می‌شود، باید صریحاً همان دامنه‌ای که در تنظیمات x-ui (subDomain)
-	// ثبت شده را جایگزین کنیم، وگرنه x-ui با 403 آن را رد می‌کند.
 	if cfg.Domain != "" {
 		req.Host = cfg.Domain
 	}
@@ -1424,17 +1387,18 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// 📌 پچ ۳: انتقال هدرها
+	copySubscriptionHeaders(w.Header(), resp.Header)
+
 	bodyBytes, _ := io.ReadAll(resp.Body)
+	
+	// 📌 پچ ۴: لاگر امن
+	debugSubscriptionResponse("x-ui", r, resp, bodyBytes)
 
 	userInboundID := getUserInboundID(subID)
 	extraConfigs := getCachedConfigsForInbound(userInboundID)
 
-	// به‌جای حدس‌زدن نوع کلاینت از روی User-Agent (که ممکن است با تشخیص
-	// داخلی خود x-ui هماهنگ نباشد)، مستقیماً به شکل واقعی محتوایی که از
-	// x-ui برگشته نگاه می‌کنیم: اگر HTML است، تزریق در HTML انجام می‌شود؛
-	// در غیر این صورت (چه base64 خام باشد چه متن ساده)، کانفیگ‌های اضافه
-	// ادغام و دوباره base64 می‌شوند. این‌طور صرف‌نظر از تشخیص x-ui، کاربر
-	// همیشه کانفیگ‌های کامل را می‌گیرد.
 	trimmedBody := strings.TrimSpace(string(bodyBytes))
 	ct := resp.Header.Get("Content-Type")
 	looksLikeHTML := strings.Contains(strings.ToLower(ct), "html") || strings.HasPrefix(trimmedBody, "<")
@@ -1460,8 +1424,10 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
+	
+	// 📌 پچ ۲: استفاده از StdEncoding
 	if isBase64 {
-		encodedFinal := base64.RawStdEncoding.EncodeToString([]byte(allConfigs))
+		encodedFinal := base64.StdEncoding.EncodeToString([]byte(allConfigs))
 		w.Write([]byte(encodedFinal))
 		return
 	}
@@ -1485,7 +1451,6 @@ func masterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// حالت پیش‌فرض: x-ui
 	cfg := getXUIConfig()
 	if strings.HasPrefix(r.URL.Path, cfg.Path) {
 		subID := strings.TrimPrefix(r.URL.Path, cfg.Path)
@@ -1496,9 +1461,6 @@ func masterHandler(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// cliResetAdminPassword lets an admin reset the console password directly
-// from the command line, without needing to hand-generate a bcrypt hash.
-// Usage: sub_aggregator_go_bin reset-admin-password <username> <new_password>
 func cliResetAdminPassword() {
 	if len(os.Args) < 4 {
 		fmt.Println("Usage: sub_aggregator_go_bin reset-admin-password <username> <new_password>")
@@ -1591,16 +1553,13 @@ func main() {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil {
 		log.Fatalf("ساخت پوشه‌ی سوکت (%s) ناموفق بود: %v", filepath.Dir(socketPath), err)
 	}
-	_ = os.Remove(socketPath) // اگر از اجرای قبلی باقی مانده باشد، پاک می‌کنیم تا bind گیر نکند
+	_ = os.Remove(socketPath) 
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		log.Fatalf("گوش دادن روی Unix Socket (%s) ناموفق بود: %v", socketPath, err)
 	}
-	// به‌جای 0666 (قابل‌دسترس برای همه‌ی یوزرهای محلی سرور)، فقط گروه
-	// www-data (که آپاچی باهاش اجرا می‌شه) رو مجاز می‌کنیم. اگه این گروه
-	// روی سیستم پیدا نشد (توزیع‌های غیر Debian/Ubuntu)، برای جلوگیری از
-	// قطع شدن دسترسی آپاچی، به‌صورت امن به 0666 برمی‌گردیم.
+	
 	if grp, err := user.LookupGroup("www-data"); err == nil {
 		if gid, err2 := strconv.Atoi(grp.Gid); err2 == nil {
 			if err3 := os.Chown(socketPath, -1, gid); err3 == nil {
