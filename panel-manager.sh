@@ -907,10 +907,11 @@ action_uninstall() {
   rm -rf "$OVERRIDE_DIR"
   systemctl daemon-reload
   rm -f "$BIN_PATH"
-  ok "Service and binary removed."
+  rm -f "$LAUNCHER_PATH"
+  ok "Service, binary, and launcher (agora) removed."
   if confirm "Also delete the database (main links, cached configs, admin password)?"; then
-    rm -f "${INSTALL_DIR}/aggregator.db"
-    ok "Database deleted."
+    rm -rf "$INSTALL_DIR"
+    ok "Database and project directory deleted."
   fi
   local domain
   domain=$(load_state "domain" "")
@@ -921,6 +922,8 @@ action_uninstall() {
     ok "Apache vhost removed."
   fi
   pause
+  # Exit completely so the menu does not loop back after uninstall
+  exit 0
 }
 
 # ---------------------------------------------------------------------------
