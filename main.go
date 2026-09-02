@@ -48,12 +48,11 @@ var (
 	SANAEI_PORT    = envOrDefault("SANAEI_PORT", "2096")
 	LISTEN_PORT    = envOrDefault("SUB_AGG_LISTEN_PORT", ":8443")
 
-	// ---- تنظیمات مربوط به پشتیبانی چندپنلی ----
 	PANEL_TYPE            = os.Getenv("PANEL_TYPE")
 	PASARGUARD_PORT       = envOrDefault("PASARGUARD_PORT", "8000")
-	PASARGUARD_SUB_PATH   = envOrDefault("PASARGUARD_SUB_PATH", "/sub/") 
-	PASARGUARD_SCHEME     = envOrDefault("PASARGUARD_SCHEME", "http")    
-	PASARGUARD_ADMIN_USER = os.Getenv("PASARGUARD_ADMIN_USER")           
+	PASARGUARD_SUB_PATH   = envOrDefault("PASARGUARD_SUB_PATH", "/sub/")
+	PASARGUARD_SCHEME     = envOrDefault("PASARGUARD_SCHEME", "http")
+	PASARGUARD_ADMIN_USER = os.Getenv("PASARGUARD_ADMIN_USER")
 	PASARGUARD_ADMIN_PASS = os.Getenv("PASARGUARD_ADMIN_PASS")
 
 	BOT_INBOUND_FORMAT = envOrDefault("BOT_INBOUND_FORMAT", "plain")
@@ -211,8 +210,6 @@ func loadXUIRuntimeConfig() {
 				}
 			}
 			rows.Close()
-		} else {
-			log.Printf("⚠️  خواندن تنظیمات از x-ui.db ناموفق بود: %v", err)
 		}
 	}
 
@@ -234,9 +231,7 @@ func initMySQLDB() {
 	}
 	mysqlDB.SetMaxOpenConns(3)
 	mysqlDB.SetConnMaxLifetime(5 * time.Minute)
-	if err := mysqlDB.Ping(); err != nil {
-		log.Printf("⚠️  Ping اولیه به MySQL ناموفق بود: %v", err)
-	}
+	mysqlDB.Ping()
 }
 
 func isInfoOrFakeConfig(line string) bool {
@@ -257,6 +252,31 @@ func isInfoOrFakeConfig(line string) bool {
 	return false
 }
 
+// 📌 Pipeline: Canonical Architecture Functions
+
+func looksLikeHTMLResponse(body []byte, contentType string) bool {
+	ct := strings.ToLower(contentType)
+	trimmed := strings.TrimSpace(string(body))
+	return strings.Contains(ct, "text/html") ||
+		strings.HasPrefix(trimmed, "<!doctype html") ||
+		strings.HasPrefix(trimmed, "<html")
+}
+
+func containsValidSubscriptionURI(text string) bool {
+	lines := strings.Split(text, "\n")
+	validProtocols := []string{"vless://", "vmess://", "ss://", "trojan://", "tuic://", "hysteria2://", "hysteria://", "wireguard://", "wg://", "tg://", "socks://", "http://"}
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		for _, proto := range validProtocols {
+			if strings.HasPrefix(line, proto) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isValidConfigLine(line string) bool {
 	validProtocols := []string{"vless://", "vmess://", "ss://", "trojan://", "tuic://", "hysteria2://", "hysteria://", "wireguard://", "wg://", "tg://", "socks://", "http://"}
 	for _, proto := range validProtocols {
@@ -267,26 +287,96 @@ func isValidConfigLine(line string) bool {
 	return false
 }
 
-func getMD5Hash(text string) string {
-	hasher := md5.New()
-	hasher.Write([]byte(strings.TrimSpace(text)))
-	return hex.EncodeToString(hasher.Sum(nil))
+func normalizeSubscriptionText(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+
+	return strings.Join(out, "\n")
 }
 
-func decodeBase64(data string) (string, bool) {
+func decodeSubscriptionPayload(data string) (string, bool) {
 	data = strings.TrimSpace(data)
 	if data == "" {
 		return "", false
 	}
-	s := data
-	if mod := len(s) % 4; mod != 0 {
-		s += strings.Repeat("=", 4-mod)
+
+	var candidates []string
+	candidates = append(candidates, data)
+
+	if mod := len(data) % 4; mod != 0 {
+		padded := data + strings.Repeat("=", 4-mod)
+		candidates = append(candidates, padded)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return "", false
+
+	for _, candidate := range candidates {
+		decoded, err := base64.StdEncoding.DecodeString(candidate)
+		if err != nil {
+			continue
+		}
+		text := normalizeSubscriptionText(string(decoded))
+		if containsValidSubscriptionURI(text) {
+			return text, true
+		}
 	}
-	return string(decoded), true
+
+	return normalizeSubscriptionText(data), false
+}
+
+func copySubscriptionHeaders(dst, src http.Header) {
+	for _, key := range []string{
+		"Subscription-Userinfo",
+		"Profile-Update-Interval",
+		"Profile-Title",
+		"Support-Url",
+		"Profile-Web-Page-Url",
+		"Announce",
+		"Content-Disposition",
+	} {
+		values := src.Values(key)
+		if len(values) == 0 {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func debugSubscriptionResponse(tag string, r *http.Request, resp *http.Response, body []byte) {
+	if os.Getenv("SUB_AGG_DEBUG") != "1" {
+		return
+	}
+	isBase64 := "false"
+	if _, ok := decodeSubscriptionPayload(string(body)); ok {
+		isBase64 = "true"
+	}
+	log.Printf(
+		"[SUB-DEBUG][%s] UA=%q Status=%d Content-Type=%q BodyLen=%d Base64=%s",
+		tag,
+		r.Header.Get("User-Agent"),
+		resp.StatusCode,
+		resp.Header.Get("Content-Type"),
+		len(body),
+		isBase64,
+	)
+}
+
+func getMD5Hash(text string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(strings.TrimSpace(text)))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func fetchAndCache() {
@@ -320,7 +410,7 @@ func fetchAndCache() {
 
 	for _, l := range links {
 		req, _ := http.NewRequest("GET", strings.TrimSpace(l.URL), nil)
-		req.Header.Set("User-Agent", "v2rayNG/1.8.5")
+		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -335,14 +425,8 @@ func fetchAndCache() {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		content := string(bodyBytes)
-		decoded, _ := decodeBase64(content)
-		var lines []string
-		if decoded != "" {
-			lines = strings.Split(decoded, "\n")
-		} else {
-			lines = strings.Split(content, "\n")
-		}
+		payloadText, _ := decodeSubscriptionPayload(string(bodyBytes))
+		lines := strings.Split(payloadText, "\n")
 
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
@@ -419,7 +503,7 @@ func syncBotInbound() {
 		if err != nil {
 			log.Printf("[SyncBot] خطا در به‌روزرسانی دسته '%s': %v", s.Cat, err)
 		} else {
-			log.Printf("[SyncBot] دسته '%s' → اینباند %s به‌روزرسانی شد. (فرمت: %s)", s.Cat, inboundValue, BOT_INBOUND_FORMAT)
+			log.Printf("[SyncBot] دسته '%s' → اینباند %s به‌روزرسانی شد", s.Cat, inboundValue)
 		}
 	}
 }
@@ -489,55 +573,6 @@ func normalizeURIPath(v string) string {
 	return v
 }
 
-// 📌 پچ ۱: اضافه شدن کلاینت happ به لیست مجاز
-func isV2rayUserAgent(userAgent string) bool {
-	ua := strings.ToLower(userAgent)
-	for _, c := range []string{"v2ray", "ng", "sing-box", "clash", "shadowrocket", "streisand", "karing", "neko", "hiddify", "happ"} {
-		if strings.Contains(ua, c) {
-			return true
-		}
-	}
-	return false
-}
-
-// 📌 پچ ۳: تابع انتقال هدرهای متادیتا به سمت کاربر
-func copySubscriptionHeaders(dst, src http.Header) {
-	for _, key := range []string{
-		"Subscription-Userinfo",
-		"Profile-Title",
-		"Profile-Update-Interval",
-		"Support-Url",
-		"Content-Disposition",
-	} {
-		if values := src.Values(key); len(values) > 0 {
-			dst.Del(key)
-			for _, value := range values {
-				dst.Add(key, value)
-			}
-		}
-	}
-}
-
-// 📌 پچ ۴: لاگر امن برای دیباگ خروجی ارسالی به کلاینت
-func debugSubscriptionResponse(tag string, r *http.Request, resp *http.Response, body []byte) {
-	if os.Getenv("SUB_AGG_DEBUG") != "1" {
-		return
-	}
-	isBase64 := "false"
-	if _, ok := decodeBase64(string(body)); ok {
-		isBase64 = "true"
-	}
-	log.Printf(
-		"[SUB-DEBUG][%s] UA=%q Status=%d Content-Type=%q BodyLen=%d Base64=%s",
-		tag,
-		r.Header.Get("User-Agent"),
-		resp.StatusCode,
-		resp.Header.Get("Content-Type"),
-		len(body),
-		isBase64,
-	)
-}
-
 func getCachedConfigsForGroups(groupIDs []int) []string {
 	if len(groupIDs) == 0 {
 		return getCachedConfigsForInbound(-1)
@@ -587,7 +622,6 @@ func fetchPasarGuardUserInfo(token string) *pasarGuardUserInfo {
 	body, _ := io.ReadAll(resp.Body)
 	var info pasarGuardUserInfo
 	if err := json.Unmarshal(body, &info); err != nil {
-		log.Printf("[PasarGuard] خطا در تجزیه‌ی JSON: %v", err)
 		return nil
 	}
 	return &info
@@ -637,7 +671,6 @@ func jalaliDayOfPurchase(createdAt string) int {
 	if err != nil {
 		t, err = time.Parse("2006-01-02T15:04:05", createdAt)
 		if err != nil {
-			log.Printf("[PasarGuard] تجزیه‌ی created_at ناموفق بود ('%s'): %v", createdAt, err)
 			return 0
 		}
 	}
@@ -693,6 +726,7 @@ func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string
 	return htmlStr[:idx] + sb.String() + htmlStr[idx:]
 }
 
+// 📌 Pipeline: PasarGuard Sub Handler
 func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	setNoCacheHeaders(w)
 	if token == "" {
@@ -702,12 +736,24 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 
 	upstreamURL := fmt.Sprintf("%s://127.0.0.1:%s%s%s", PASARGUARD_SCHEME, PASARGUARD_PORT, PASARGUARD_SUB_PATH, token)
 	client := &http.Client{Timeout: 8 * time.Second}
-
 	req, _ := http.NewRequest("GET", upstreamURL, nil)
+
+	// 📌 Content Negotiation: درخواست HTML فقط اگر کلاینت صریحاً مرورگر باشد
+	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
+
 	for k, v := range r.Header {
+		if strings.ToLower(k) == "accept-encoding" {
+			continue
+		}
 		req.Header[k] = v
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	
+	// 📌 عبور از User-Agent Sniffing و اعمال هدرهای ماشین‌خوان
+	if !wantsHTML {
+		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
+		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -716,12 +762,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	defer resp.Body.Close()
 
-	// 📌 پچ ۳: انتقال هدرها
-	copySubscriptionHeaders(w.Header(), resp.Header)
-
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	
-	// 📌 پچ ۴: لاگر امن
 	debugSubscriptionResponse("PasarGuard", r, resp, bodyBytes)
 
 	if resp.StatusCode != 200 {
@@ -735,9 +776,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
-	userAgent := r.Header.Get("User-Agent")
-	isV2ray := isV2rayUserAgent(userAgent)
-
 	userInfo := fetchPasarGuardUserInfo(token)
 	var purchaseDay int
 	if userInfo != nil {
@@ -746,41 +784,44 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	extraConfigs := getCachedConfigsForDay(purchaseDay)
 
 	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "text/plain; charset=utf-8"
-	}
-	w.Header().Set("Content-Type", ct)
+	isHTML := looksLikeHTMLResponse(bodyBytes, ct)
 
-	if !isV2ray {
-		if strings.Contains(strings.ToLower(ct), "html") {
-			updatedHTML := injectExtraIntoPasarGuardHTML(string(bodyBytes), extraConfigs)
-			w.WriteHeader(resp.StatusCode)
-			w.Write([]byte(updatedHTML))
-		} else {
-			w.WriteHeader(resp.StatusCode)
-			w.Write(bodyBytes)
+	if isHTML {
+		if ct == "" {
+			ct = "text/html; charset=utf-8"
 		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		w.Write([]byte(injectExtraIntoPasarGuardHTML(string(bodyBytes), extraConfigs)))
 		return
 	}
 
-	decoded, isBase64 := decodeBase64(string(bodyBytes))
-	allConfigs := string(bodyBytes)
-	if isBase64 {
-		allConfigs = decoded
-	}
-	if len(extraConfigs) > 0 {
-		allConfigs += "\n" + strings.Join(extraConfigs, "\n")
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(resp.StatusCode)
+	// 📌 Canonical Pipeline for VPN Clients
+	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
 	
-	// 📌 پچ ۲: استفاده از StdEncoding برای پدینگ استاندارد در Base64
-	if isBase64 {
-		encodedFinal := base64.StdEncoding.EncodeToString([]byte(allConfigs))
-		w.Write([]byte(encodedFinal))
-		return
+	var configs []string
+	if payloadText != "" {
+		configs = strings.Split(payloadText, "\n")
 	}
-	w.Write([]byte(allConfigs))
+	configs = append(configs, extraConfigs...)
+	
+	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
+	
+	copySubscriptionHeaders(w.Header(), resp.Header)
+	
+	if wasBase64 {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		encodedFinal := base64.StdEncoding.EncodeToString([]byte(finalPayload))
+		w.Write([]byte(encodedFinal))
+	} else {
+		if ct == "" {
+			ct = "text/plain; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		w.Write([]byte(finalPayload))
+	}
 }
 
 type pgGroupSimple struct {
@@ -813,12 +854,10 @@ func getPasarGuardAdminToken(forceRefresh bool) string {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.PostForm(loginURL, form)
 	if err != nil {
-		log.Printf("[PasarGuard] لاگین ادمین ناموفق بود: %v", err)
 		return ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("[PasarGuard] لاگین ادمین با کد %d رد شد (یوزر/پسورد را بررسی کنید)", resp.StatusCode)
 		return ""
 	}
 	body, _ := io.ReadAll(resp.Body)
@@ -826,7 +865,6 @@ func getPasarGuardAdminToken(forceRefresh bool) string {
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.Unmarshal(body, &tok); err != nil || tok.AccessToken == "" {
-		log.Printf("[PasarGuard] پاسخ لاگین ادمین قابل تجزیه نبود: %v", err)
 		return ""
 	}
 	pgTokenCache = tok.AccessToken
@@ -850,7 +888,6 @@ func getPasarGuardGroups() []pgGroupSimple {
 
 	resp, err := fetch(token)
 	if err != nil {
-		log.Printf("[PasarGuard] خطا در گرفتن لیست گروه‌ها: %v", err)
 		return nil
 	}
 	if resp.StatusCode == 401 {
@@ -866,7 +903,6 @@ func getPasarGuardGroups() []pgGroupSimple {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("[PasarGuard] دریافت لیست گروه‌ها با کد %d رد شد", resp.StatusCode)
 		return nil
 	}
 
@@ -875,7 +911,6 @@ func getPasarGuardGroups() []pgGroupSimple {
 		Groups []pgGroupSimple `json:"groups"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		log.Printf("[PasarGuard] تجزیه‌ی JSON لیست گروه‌ها ناموفق بود: %v", err)
 		return nil
 	}
 	return parsed.Groups
@@ -1080,7 +1115,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </div>
 <div class="modal-footer">
 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
-<button type="submit" class="btn btn-primary">ذخیره تغییرات</button>
+<button type="submit" class="btn primary">ذخیره تغییرات</button>
 </div>
 </form>
 </div></div></div>
@@ -1360,6 +1395,7 @@ func setNoCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Pragma", "no-cache")
 }
 
+// 📌 Pipeline: x-ui Sub Handler
 func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	setNoCacheHeaders(w)
 	if subID == "" {
@@ -1369,17 +1405,31 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 
 	cfg := getXUIConfig()
 	sanaeiURL := fmt.Sprintf("https://127.0.0.1:%s%s%s", cfg.Port, cfg.Path, subID)
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-
 	req, _ := http.NewRequest("GET", sanaeiURL, nil)
+
+	// 📌 Content Negotiation: درخواست HTML فقط اگر کلاینت صریحاً مرورگر باشد
+	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
+
 	for k, v := range r.Header {
+		if strings.ToLower(k) == "accept-encoding" {
+			continue
+		}
 		req.Header[k] = v
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	
+	// 📌 عبور از User-Agent Sniffing و اعمال هدرهای ماشین‌خوان
+	if !wantsHTML {
+		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
+		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
+	}
+
 	if cfg.Domain != "" {
 		req.Host = cfg.Domain
 	}
+
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1388,50 +1438,57 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 	defer resp.Body.Close()
 
-	// 📌 پچ ۳: انتقال هدرها
-	copySubscriptionHeaders(w.Header(), resp.Header)
-
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	
-	// 📌 پچ ۴: لاگر امن
 	debugSubscriptionResponse("x-ui", r, resp, bodyBytes)
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(resp.StatusCode)
+		w.Write(bodyBytes)
+		return
+	}
 
 	userInboundID := getUserInboundID(subID)
 	extraConfigs := getCachedConfigsForInbound(userInboundID)
 
-	trimmedBody := strings.TrimSpace(string(bodyBytes))
 	ct := resp.Header.Get("Content-Type")
-	looksLikeHTML := strings.Contains(strings.ToLower(ct), "html") || strings.HasPrefix(trimmedBody, "<")
+	isHTML := looksLikeHTMLResponse(bodyBytes, ct)
 
-	if looksLikeHTML {
+	if isHTML {
 		if ct == "" {
 			ct = "text/html; charset=utf-8"
 		}
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(resp.StatusCode)
-		updatedHTML := injectExtraIntoSanaeiHTML(string(bodyBytes), extraConfigs)
-		w.Write([]byte(updatedHTML))
+		w.Write([]byte(injectExtraIntoSanaeiHTML(string(bodyBytes), extraConfigs)))
 		return
 	}
 
-	sanaeiDecoded, isBase64 := decodeBase64(trimmedBody)
-	allConfigs := trimmedBody
-	if isBase64 {
-		allConfigs = sanaeiDecoded
-	}
-	if len(extraConfigs) > 0 {
-		allConfigs += "\n" + strings.Join(extraConfigs, "\n")
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(resp.StatusCode)
+	// 📌 Canonical Pipeline for VPN Clients
+	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
 	
-	// 📌 پچ ۲: استفاده از StdEncoding
-	if isBase64 {
-		encodedFinal := base64.StdEncoding.EncodeToString([]byte(allConfigs))
-		w.Write([]byte(encodedFinal))
-		return
+	var configs []string
+	if payloadText != "" {
+		configs = strings.Split(payloadText, "\n")
 	}
-	w.Write([]byte(allConfigs))
+	configs = append(configs, extraConfigs...)
+	
+	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
+	
+	copySubscriptionHeaders(w.Header(), resp.Header)
+	
+	if wasBase64 {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		encodedFinal := base64.StdEncoding.EncodeToString([]byte(finalPayload))
+		w.Write([]byte(encodedFinal))
+	} else {
+		if ct == "" {
+			ct = "text/plain; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		w.Write([]byte(finalPayload))
+	}
 }
 
 func masterHandler(w http.ResponseWriter, r *http.Request) {
