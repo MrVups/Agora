@@ -602,9 +602,11 @@ func getCachedConfigsForGroups(groupIDs []int) []string {
 	return out
 }
 
+// 📌 پچ جدید: اضافه شدن فیلد Status برای خواندن وضعیت کاربر از پاسارگارد
 type pasarGuardUserInfo struct {
 	GroupIDs  []int  `json:"group_ids"`
 	CreatedAt string `json:"created_at"`
+	Status    string `json:"status"`
 }
 
 func fetchPasarGuardUserInfo(token string) *pasarGuardUserInfo {
@@ -738,7 +740,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	client := &http.Client{Timeout: 8 * time.Second}
 	req, _ := http.NewRequest("GET", upstreamURL, nil)
 
-	// 📌 Content Negotiation: درخواست HTML فقط اگر کلاینت صریحاً مرورگر باشد
 	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
 
 	for k, v := range r.Header {
@@ -749,7 +750,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 	
-	// 📌 عبور از User-Agent Sniffing و اعمال هدرهای ماشین‌خوان
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
@@ -776,12 +776,24 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
+	// 📌 پچ جدید: بررسی وضعیت کاربر قبل از واکشی کانفیگ‌های مادر
 	userInfo := fetchPasarGuardUserInfo(token)
 	var purchaseDay int
+	userIsActive := true // پیش‌فرض فعال است
+
 	if userInfo != nil {
 		purchaseDay = jalaliDayOfPurchase(userInfo.CreatedAt)
+		statusLower := strings.ToLower(strings.TrimSpace(userInfo.Status))
+		// اگر کاربر منقضی یا غیرفعال شده بود، وضعیت را false می‌کنیم
+		if statusLower == "expired" || statusLower == "disabled" || statusLower == "limited" {
+			userIsActive = false
+		}
 	}
-	extraConfigs := getCachedConfigsForDay(purchaseDay)
+
+	var extraConfigs []string
+	if userIsActive {
+		extraConfigs = getCachedConfigsForDay(purchaseDay)
+	}
 
 	ct := resp.Header.Get("Content-Type")
 	isHTML := looksLikeHTMLResponse(bodyBytes, ct)
@@ -796,13 +808,14 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
-	// 📌 Canonical Pipeline for VPN Clients
 	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
 	
 	var configs []string
 	if payloadText != "" {
 		configs = strings.Split(payloadText, "\n")
 	}
+	
+	// در صورت غیرفعال بودن کاربر، این آرایه خالی است و هیچ‌چیزی به خروجی پاسارگارد اضافه نمی‌شود
 	configs = append(configs, extraConfigs...)
 	
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
@@ -1407,7 +1420,6 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	sanaeiURL := fmt.Sprintf("https://127.0.0.1:%s%s%s", cfg.Port, cfg.Path, subID)
 	req, _ := http.NewRequest("GET", sanaeiURL, nil)
 
-	// 📌 Content Negotiation: درخواست HTML فقط اگر کلاینت صریحاً مرورگر باشد
 	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
 
 	for k, v := range r.Header {
@@ -1418,7 +1430,6 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 	
-	// 📌 عبور از User-Agent Sniffing و اعمال هدرهای ماشین‌خوان
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
@@ -1463,7 +1474,6 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		return
 	}
 
-	// 📌 Canonical Pipeline for VPN Clients
 	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
 	
 	var configs []string
