@@ -602,11 +602,62 @@ func getCachedConfigsForGroups(groupIDs []int) []string {
 	return out
 }
 
-// 📌 پچ جدید: اضافه شدن فیلد Status برای خواندن وضعیت کاربر از پاسارگارد
 type pasarGuardUserInfo struct {
 	GroupIDs  []int  `json:"group_ids"`
 	CreatedAt string `json:"created_at"`
 	Status    string `json:"status"`
+}
+
+// 📌 پچ جدید (v1.0.5): پیاده‌سازی Smart TTL Cache برای مدیریت بهینه حافظه
+type cachedUserInfo struct {
+	info      *pasarGuardUserInfo
+	expiresAt time.Time
+}
+
+var (
+	pgUserInfoCache     = make(map[string]cachedUserInfo)
+	pgUserInfoCacheLock sync.RWMutex
+)
+
+// تابع واکشی اطلاعات با بررسی کش
+func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
+	// بررسی موجود بودن در رم (سرعت نور)
+	pgUserInfoCacheLock.RLock()
+	cached, exists := pgUserInfoCache[token]
+	pgUserInfoCacheLock.RUnlock()
+
+	if exists && time.Now().Before(cached.expiresAt) {
+		return cached.info
+	}
+
+	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
+	info := fetchPasarGuardUserInfo(token)
+
+	// ذخیره در رم با ۵ دقیقه اعتبار
+	pgUserInfoCacheLock.Lock()
+	pgUserInfoCache[token] = cachedUserInfo{
+		info:      info,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	}
+	pgUserInfoCacheLock.Unlock()
+
+	return info
+}
+
+// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۱۰ دقیقه
+func startUserInfoCacheGC() {
+	for {
+		time.Sleep(10 * time.Minute)
+		now := time.Now()
+		
+		pgUserInfoCacheLock.Lock()
+		for token, cached := range pgUserInfoCache {
+			if now.After(cached.expiresAt) {
+				delete(pgUserInfoCache, token)
+			}
+		}
+		pgUserInfoCacheLock.Unlock()
+	}
 }
 
 func fetchPasarGuardUserInfo(token string) *pasarGuardUserInfo {
@@ -776,15 +827,14 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
-	// 📌 پچ جدید: بررسی وضعیت کاربر قبل از واکشی کانفیگ‌های مادر
-	userInfo := fetchPasarGuardUserInfo(token)
+	// 📌 استفاده از تابع کش شده به جای فراخوانی مستقیم
+	userInfo := getPasarGuardUserInfoCached(token)
 	var purchaseDay int
-	userIsActive := true // پیش‌فرض فعال است
+	userIsActive := true
 
 	if userInfo != nil {
 		purchaseDay = jalaliDayOfPurchase(userInfo.CreatedAt)
 		statusLower := strings.ToLower(strings.TrimSpace(userInfo.Status))
-		// اگر کاربر منقضی یا غیرفعال شده بود، وضعیت را false می‌کنیم
 		if statusLower == "expired" || statusLower == "disabled" || statusLower == "limited" {
 			userIsActive = false
 		}
@@ -815,7 +865,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		configs = strings.Split(payloadText, "\n")
 	}
 	
-	// در صورت غیرفعال بودن کاربر، این آرایه خالی است و هیچ‌چیزی به خروجی پاسارگارد اضافه نمی‌شود
 	configs = append(configs, extraConfigs...)
 	
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
@@ -1584,6 +1633,11 @@ func main() {
 
 	if strings.EqualFold(PANEL_TYPE, "pasarguard") {
 		log.Printf("🧩 حالت پنل: PasarGuard (Port=%s Path=%s Scheme=%s)", PASARGUARD_PORT, normalizeURIPath(PASARGUARD_SUB_PATH), PASARGUARD_SCHEME)
+		
+		// 📌 پچ جدید: راه‌اندازی Garbage Collector برای پاکسازی خودکار رم
+		go startUserInfoCacheGC()
+		log.Printf("🧹 پردازشگر پاکسازی حافظه موقت (Garbage Collector) با موفقیت فعال شد.")
+
 	} else {
 		log.Printf("🧩 حالت پنل: x-ui")
 		initXUIDB()
