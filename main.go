@@ -103,7 +103,9 @@ func initDB() {
 			url TEXT,
 			target_inbounds TEXT DEFAULT 'all',
 			is_active INTEGER DEFAULT 1,
-			last_updated TEXT DEFAULT '-'
+			last_updated TEXT DEFAULT '-',
+			pool_name TEXT NOT NULL DEFAULT '',
+			rotation_hours INTEGER NOT NULL DEFAULT 0
 		);`,
 		`CREATE TABLE IF NOT EXISTS category_schedules (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +129,66 @@ func initDB() {
 			log.Printf("DB Init Table Error: %v", err)
 		}
 	}
+
+	migrateMainLinksPoolingSchema()
 	seedOrMigrateAdminPassword()
+}
+
+func migrateMainLinksPoolingSchema() {
+	rows, err := db.Query("PRAGMA table_info(main_links)")
+	if err != nil {
+		log.Printf("[DBMigration] خواندن schema جدول main_links ناموفق بود: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			colType  string
+			notNull  int
+			defaultV interface{}
+			primary  int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primary); err != nil {
+			log.Printf("[DBMigration] خواندن ستون main_links ناموفق بود: %v", err)
+			return
+		}
+		existing[name] = true
+	}
+
+	migrations := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "pool_name",
+			stmt: "ALTER TABLE main_links ADD COLUMN pool_name TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			name: "rotation_hours",
+			stmt: "ALTER TABLE main_links ADD COLUMN rotation_hours INTEGER NOT NULL DEFAULT 0",
+		},
+	}
+
+	for _, m := range migrations {
+		if existing[m.name] {
+			continue
+		}
+		if _, err := db.Exec(m.stmt); err != nil {
+			// اگر race یا مهاجرت قبلی باعث شده ستون همزمان اضافه شده باشد،
+			// خطای duplicate column را فقط به‌صورت warning ثبت می‌کنیم.
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+				log.Printf("[DBMigration] ستون %s قبلاً وجود دارد؛ ادامه می‌دهیم.", m.name)
+				continue
+			}
+			log.Printf("[DBMigration] افزودن ستون %s ناموفق بود: %v", m.name, err)
+			continue
+		}
+		log.Printf("[DBMigration] ستون %s با موفقیت اضافه شد.", m.name)
+	}
 }
 
 func seedOrMigrateAdminPassword() {
@@ -265,7 +326,7 @@ func looksLikeHTMLResponse(body []byte, contentType string) bool {
 func containsValidSubscriptionURI(text string) bool {
 	lines := strings.Split(text, "\n")
 	validProtocols := []string{"vless://", "vmess://", "ss://", "trojan://", "tuic://", "hysteria2://", "hysteria://", "wireguard://", "wg://", "tg://", "socks://", "http://"}
-	
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		for _, proto := range validProtocols {
@@ -383,33 +444,117 @@ func fetchAndCache() {
 	dbLock.Lock()
 	defer dbLock.Unlock()
 
-	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all') FROM main_links WHERE COALESCE(is_active, 1) = 1")
+	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all'), COALESCE(pool_name, ''), COALESCE(rotation_hours, 0) FROM main_links WHERE COALESCE(is_active, 1) = 1")
 	if err != nil {
 		log.Printf("[CronFetch] DB Error: %v", err)
 		return
 	}
+
 	type FetchItem struct {
 		ID            int
 		Title         string
 		URL           string
 		TargetInbound string
+		PoolName      string
+		RotationHours int
 	}
+
 	var links []FetchItem
 	for rows.Next() {
 		var item FetchItem
-		if err := rows.Scan(&item.ID, &item.Title, &item.URL, &item.TargetInbound); err == nil {
+		if err := rows.Scan(
+			&item.ID,
+			&item.Title,
+			&item.URL,
+			&item.TargetInbound,
+			&item.PoolName,
+			&item.RotationHours,
+		); err == nil {
+			item.PoolName = strings.TrimSpace(item.PoolName)
+			if item.RotationHours < 0 {
+				item.RotationHours = 0
+			}
 			links = append(links, item)
+		} else {
+			log.Printf("[CronFetch] خواندن لینک از DB ناموفق بود: %v", err)
 		}
 	}
 	rows.Close()
+
+	// انتخاب لینک‌های قابل واکشی:
+	// - لینک بدون pool_name هر بار واکشی می‌شود.
+	// - برای هر target_inbounds + pool_name فقط یک لینک فعال می‌شود.
+	// - rotation_hours موثر، بیشترین مقدار ثبت‌شده در آن pool است؛ در صورت صفر بودن همه، 1 ساعت.
+	type poolKey struct {
+		TargetInbound string
+		PoolName      string
+	}
+
+	pools := make(map[poolKey][]FetchItem)
+	selectedIDs := make(map[int]bool)
+
+	for _, l := range links {
+		if l.PoolName == "" {
+			continue
+		}
+		key := poolKey{
+			TargetInbound: l.TargetInbound,
+			PoolName:      l.PoolName,
+		}
+		pools[key] = append(pools[key], l)
+	}
+
+	currentUnixHour := time.Now().Unix() / int64(time.Hour/time.Second)
+
+	for key, poolLinks := range pools {
+		sort.SliceStable(poolLinks, func(i, j int) bool {
+			return poolLinks[i].ID < poolLinks[j].ID
+		})
+
+		rotationHours := 1
+		for _, l := range poolLinks {
+			if l.RotationHours > rotationHours {
+				rotationHours = l.RotationHours
+			}
+		}
+		if rotationHours <= 0 {
+			rotationHours = 1
+		}
+
+		windowIndex := (currentUnixHour / int64(rotationHours)) % int64(len(poolLinks))
+		selected := poolLinks[int(windowIndex)]
+		selectedIDs[selected.ID] = true
+
+		log.Printf(
+			"[Pool] target=%q pool=%q size=%d rotation=%dh window=%d selected=%d (%s)",
+			key.TargetInbound,
+			key.PoolName,
+			len(poolLinks),
+			rotationHours,
+			windowIndex,
+			selected.ID,
+			selected.Title,
+		)
+	}
+
+	var linksToFetch []FetchItem
+	for _, l := range links {
+		if l.PoolName == "" || selectedIDs[l.ID] {
+			linksToFetch = append(linksToFetch, l)
+		}
+	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	var allFetchedConfigs [][2]string
 	seenHashes := make(map[string]bool)
 	successful := 0
 
-	for _, l := range links {
-		req, _ := http.NewRequest("GET", strings.TrimSpace(l.URL), nil)
+	for _, l := range linksToFetch {
+		req, reqErr := http.NewRequest("GET", strings.TrimSpace(l.URL), nil)
+		if reqErr != nil {
+			log.Printf("[CronFetch] URL نامعتبر برای '%s': %v", l.Title, reqErr)
+			continue
+		}
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
 
 		resp, err := client.Do(req)
@@ -417,13 +562,18 @@ func fetchAndCache() {
 			log.Printf("[CronFetch] خطای اتصال به '%s': %v", l.Title, err)
 			continue
 		}
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			log.Printf("[CronFetch] لینک '%s' با کد %d پاسخ داد", l.Title, resp.StatusCode)
 			resp.Body.Close()
 			continue
 		}
-		bodyBytes, _ := io.ReadAll(resp.Body)
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("[CronFetch] خطای خواندن پاسخ '%s': %v", l.Title, readErr)
+			continue
+		}
 
 		payloadText, _ := decodeSubscriptionPayload(string(bodyBytes))
 		lines := strings.Split(payloadText, "\n")
@@ -443,24 +593,50 @@ func fetchAndCache() {
 		successful++
 	}
 
-	if len(allFetchedConfigs) == 0 && len(links) > 0 {
-		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری از هیچ لینکی دریافت نشد. کش قبلی حفظ می‌شود.")
+	if len(allFetchedConfigs) == 0 && len(linksToFetch) > 0 {
+		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری از لینک‌های منتخب دریافت نشد. کش قبلی حفظ می‌شود.")
 		return
 	}
 
-	db.Exec("DELETE FROM cached_configs")
+	if _, err := db.Exec("DELETE FROM cached_configs"); err != nil {
+		log.Printf("[CronFetch] خطا در پاکسازی کش قبلی: %v", err)
+		return
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("[CronFetch] DB Tx Error: %v", err)
 		return
 	}
-	stmt, _ := tx.Prepare("INSERT INTO cached_configs (inbound_id, raw_config) VALUES (?, ?)")
+
+	stmt, err := tx.Prepare("INSERT INTO cached_configs (inbound_id, raw_config) VALUES (?, ?)")
+	if err != nil {
+		tx.Rollback()
+		log.Printf("[CronFetch] Prepare Error: %v", err)
+		return
+	}
+
 	for _, cfg := range allFetchedConfigs {
-		stmt.Exec(cfg[0], cfg[1])
+		if _, err := stmt.Exec(cfg[0], cfg[1]); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			log.Printf("[CronFetch] INSERT cached_configs Error: %v", err)
+			return
+		}
 	}
 	stmt.Close()
-	tx.Commit()
-	log.Printf("[CronFetch] کش به‌روزرسانی شد. %d/%d لینک موفق. %d کانفیگ یکتا.", successful, len(links), len(allFetchedConfigs))
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[CronFetch] DB Commit Error: %v", err)
+		return
+	}
+
+	log.Printf(
+		"[CronFetch] کش به‌روزرسانی شد. %d/%d لینک منتخب واکشی شد. %d کانفیگ یکتا.",
+		successful,
+		len(linksToFetch),
+		len(allFetchedConfigs),
+	)
 }
 
 func syncBotInbound() {
@@ -649,7 +825,7 @@ func startUserInfoCacheGC() {
 	for {
 		time.Sleep(10 * time.Minute)
 		now := time.Now()
-		
+
 		pgUserInfoCacheLock.Lock()
 		for token, cached := range pgUserInfoCache {
 			if now.After(cached.expiresAt) {
@@ -800,7 +976,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		req.Header[k] = v
 	}
 	req.Header.Set("Accept-Encoding", "identity")
-	
+
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
@@ -859,18 +1035,18 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 
 	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
-	
+
 	var configs []string
 	if payloadText != "" {
 		configs = strings.Split(payloadText, "\n")
 	}
-	
+
 	configs = append(configs, extraConfigs...)
-	
+
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
-	
+
 	copySubscriptionHeaders(w.Header(), resp.Header)
-	
+
 	if wasBase64 {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(resp.StatusCode)
@@ -1011,12 +1187,14 @@ func basicAuthUser(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 type LinkRow struct {
-	ID       int
-	Title    string
-	URL      string
-	Inbounds string
-	Active   bool
-	Updated  string
+	ID            int
+	Title         string
+	URL           string
+	Inbounds      string
+	PoolName      string
+	RotationHours int
+	Active        bool
+	Updated       string
 }
 
 type LinkGroup struct {
@@ -1126,6 +1304,16 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
   <input type="text" name="target_inbounds" class="form-control" value="all" required placeholder="Inbound ID یا all">
 {{end}}
 </div>
+<div class="col-md-6">
+  <label class="form-label">نام دسته/استخر</label>
+  <input type="text" name="pool_name" class="form-control" placeholder="اختیاری؛ مثلاً Pool-A">
+  <small class="text-muted">لینک‌هایی با نام و اینباند یکسان در یک استخر قرار می‌گیرند.</small>
+</div>
+<div class="col-md-6">
+  <label class="form-label">زمان چرخش به ساعت</label>
+  <input type="number" name="rotation_hours" class="form-control" value="0" min="0" step="1" placeholder="0">
+  <small class="text-muted">۰ یعنی استفاده از مقدار پیش‌فرض ۱ ساعت.</small>
+</div>
 <div class="col-md-12"><textarea name="urls" class="form-control" rows="3" placeholder="هر لینک در یک خط" required></textarea></div>
 <div class="col-md-12 text-end"><button type="submit" class="btn btn-success px-4">ذخیره و آپدیت کش</button></div>
 </form>
@@ -1140,17 +1328,31 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </div>
 <div class="card-body p-0">
 <table class="table table-hover align-middle mb-0">
-<thead><tr><th>#</th><th>عنوان</th><th>URL</th><th>وضعیت</th><th>بروزرسانی</th><th>عملیات</th></tr></thead>
+<thead><tr><th>#</th><th>عنوان</th><th>URL</th><th>استخر</th><th>چرخش</th><th>وضعیت</th><th>بروزرسانی</th><th>عملیات</th></tr></thead>
 <tbody>
 {{range .Links}}
 <tr>
 <td>{{.ID}}</td>
 <td><strong>{{.Title}}</strong></td>
 <td><small class="text-break" style="max-width:280px;display:inline-block;">{{.URL}}</small></td>
+<td>
+{{if .PoolName}}
+  <span class="badge bg-primary">{{.PoolName}}</span>
+{{else}}
+  <span class="text-muted">مستقل</span>
+{{end}}
+</td>
+<td>
+{{if .PoolName}}
+  <span class="badge bg-info text-dark">{{.RotationHours}} ساعت</span>
+{{else}}
+  <span class="text-muted">—</span>
+{{end}}
+</td>
 <td>{{if .Active}}<span class="badge bg-success">فعال</span>{{else}}<span class="badge bg-secondary">غیرفعال</span>{{end}}</td>
 <td><small>{{.Updated}}</small></td>
 <td>
-<button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="openEditModal({{.ID}}, {{.Title}}, {{.URL}}, {{.Inbounds}})">ویرایش</button>
+<button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="openEditModal({{.ID}}, {{.Title}}, {{.URL}}, {{.Inbounds}}, {{.PoolName}}, {{.RotationHours}})">ویرایش</button>
 <form method="post" action="/aggr-console/toggle/{{.ID}}" style="display:inline"><button type="submit" class="btn btn-sm btn-outline-warning me-1">تغییر وضعیت</button></form>
 <form method="post" action="/aggr-console/delete/{{.ID}}" onsubmit="return confirm('حذف شود؟')" style="display:inline"><button type="submit" class="btn btn-sm btn-outline-danger">حذف</button></form>
 </td>
@@ -1174,6 +1376,8 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 <div class="col-md-12"><label class="form-label">عنوان</label><input type="text" name="title" id="modal_title" class="form-control" required></div>
 <div class="col-md-12"><label class="form-label">اینباند متصل (ID یا all)</label><input type="text" name="target_inbounds" id="modal_inbounds" class="form-control" required></div>
 <div class="col-md-12"><label class="form-label">آدرس URL</label><input type="url" name="url" id="modal_url" class="form-control" required></div>
+<div class="col-md-6"><label class="form-label">نام دسته/استخر</label><input type="text" name="pool_name" id="modal_pool_name" class="form-control" placeholder="اختیاری"></div>
+<div class="col-md-6"><label class="form-label">زمان چرخش به ساعت</label><input type="number" name="rotation_hours" id="modal_rotation_hours" class="form-control" min="0" step="1" value="0"></div>
 </div>
 <div class="modal-footer">
 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
@@ -1207,11 +1411,13 @@ $(document).ready(function() {
 		initialValue: false
 	});
 });
-function openEditModal(id, title, url, inbounds) {
+function openEditModal(id, title, url, inbounds, poolName, rotationHours) {
 	document.getElementById('modal_link_id').value = id;
 	document.getElementById('modal_title').value = title;
 	document.getElementById('modal_url').value = url;
 	document.getElementById('modal_inbounds').value = inbounds;
+	document.getElementById('modal_pool_name').value = poolName || '';
+	document.getElementById('modal_rotation_hours').value = Number.isFinite(Number(rotationHours)) ? Number(rotationHours) : 0;
 	var myModal = new bootstrap.Modal(document.getElementById('editModal'));
 	myModal.show();
 }
@@ -1222,13 +1428,15 @@ function openEditModal(id, title, url, inbounds) {
 var tmpl = template.Must(template.New("console").Parse(consoleTmpl))
 
 func renderConsole(w http.ResponseWriter, username string) {
-	rows, _ := db.Query("SELECT id, title, url, COALESCE(target_inbounds,'all'), COALESCE(is_active,1), COALESCE(last_updated,'-') FROM main_links ORDER BY id DESC")
+	rows, _ := db.Query("SELECT id, title, url, COALESCE(target_inbounds,'all'), COALESCE(pool_name,''), COALESCE(rotation_hours,0), COALESCE(is_active,1), COALESCE(last_updated,'-') FROM main_links ORDER BY id DESC")
 	byGroup := map[string][]LinkRow{}
 	if rows != nil {
 		for rows.Next() {
 			var l LinkRow
 			var active int
-			rows.Scan(&l.ID, &l.Title, &l.URL, &l.Inbounds, &active, &l.Updated)
+			if err := rows.Scan(&l.ID, &l.Title, &l.URL, &l.Inbounds, &l.PoolName, &l.RotationHours, &active, &l.Updated); err != nil {
+				continue
+			}
 			l.Active = active != 0
 			byGroup[l.Inbounds] = append(byGroup[l.Inbounds], l)
 		}
@@ -1327,9 +1535,19 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.Method == "POST" && r.URL.Path == "/aggr-console/add":
-		title := r.FormValue("title")
+		title := strings.TrimSpace(r.FormValue("title"))
 		urls := r.FormValue("urls")
-		inbounds := r.FormValue("target_inbounds")
+		inbounds := strings.TrimSpace(r.FormValue("target_inbounds"))
+		poolName := strings.TrimSpace(r.FormValue("pool_name"))
+		rotationHours := 0
+		if raw := strings.TrimSpace(r.FormValue("rotation_hours")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				http.Error(w, "زمان چرخش باید یک عدد صحیح بزرگ‌تر یا مساوی صفر باشد", http.StatusBadRequest)
+				return
+			}
+			rotationHours = parsed
+		}
 		lines := strings.Split(urls, "\n")
 		nowStr := time.Now().Format("2006-01-02 15:04")
 		for idx, u := range lines {
@@ -1341,18 +1559,38 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 			if len(lines) > 1 {
 				itemTitle = fmt.Sprintf("%s #%d", title, idx+1)
 			}
-			db.Exec("INSERT INTO main_links (title, url, target_inbounds, is_active, last_updated) VALUES (?, ?, ?, 1, ?)", itemTitle, u, inbounds, nowStr)
+			if _, err := db.Exec(
+				"INSERT INTO main_links (title, url, target_inbounds, pool_name, rotation_hours, is_active, last_updated) VALUES (?, ?, ?, ?, ?, 1, ?)",
+				itemTitle, u, inbounds, poolName, rotationHours, nowStr,
+			); err != nil {
+				log.Printf("[Console] افزودن لینک ناموفق بود: %v", err)
+			}
 		}
 		go fetchAndCache()
 		http.Redirect(w, r, "/aggr-console", http.StatusSeeOther)
 
 	case r.Method == "POST" && r.URL.Path == "/aggr-console/edit":
-		id := r.FormValue("link_id")
-		title := r.FormValue("title")
-		urlVal := r.FormValue("url")
-		inbounds := r.FormValue("target_inbounds")
+		id := strings.TrimSpace(r.FormValue("link_id"))
+		title := strings.TrimSpace(r.FormValue("title"))
+		urlVal := strings.TrimSpace(r.FormValue("url"))
+		inbounds := strings.TrimSpace(r.FormValue("target_inbounds"))
+		poolName := strings.TrimSpace(r.FormValue("pool_name"))
+		rotationHours := 0
+		if raw := strings.TrimSpace(r.FormValue("rotation_hours")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				http.Error(w, "زمان چرخش باید یک عدد صحیح بزرگ‌تر یا مساوی صفر باشد", http.StatusBadRequest)
+				return
+			}
+			rotationHours = parsed
+		}
 		nowStr := time.Now().Format("2006-01-02 15:04")
-		db.Exec("UPDATE main_links SET title=?, url=?, target_inbounds=?, last_updated=? WHERE id=?", title, urlVal, inbounds, nowStr, id)
+		if _, err := db.Exec(
+			"UPDATE main_links SET title=?, url=?, target_inbounds=?, pool_name=?, rotation_hours=?, last_updated=? WHERE id=?",
+			title, urlVal, inbounds, poolName, rotationHours, nowStr, id,
+		); err != nil {
+			log.Printf("[Console] ویرایش لینک ناموفق بود: %v", err)
+		}
 		go fetchAndCache()
 		http.Redirect(w, r, "/aggr-console", http.StatusSeeOther)
 
@@ -1478,7 +1716,7 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		req.Header[k] = v
 	}
 	req.Header.Set("Accept-Encoding", "identity")
-	
+
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
@@ -1524,17 +1762,17 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 
 	payloadText, wasBase64 := decodeSubscriptionPayload(string(bodyBytes))
-	
+
 	var configs []string
 	if payloadText != "" {
 		configs = strings.Split(payloadText, "\n")
 	}
 	configs = append(configs, extraConfigs...)
-	
+
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
-	
+
 	copySubscriptionHeaders(w.Header(), resp.Header)
-	
+
 	if wasBase64 {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(resp.StatusCode)
@@ -1633,7 +1871,7 @@ func main() {
 
 	if strings.EqualFold(PANEL_TYPE, "pasarguard") {
 		log.Printf("🧩 حالت پنل: PasarGuard (Port=%s Path=%s Scheme=%s)", PASARGUARD_PORT, normalizeURIPath(PASARGUARD_SUB_PATH), PASARGUARD_SCHEME)
-		
+
 		// 📌 پچ جدید: راه‌اندازی Garbage Collector برای پاکسازی خودکار رم
 		go startUserInfoCacheGC()
 		log.Printf("🧹 پردازشگر پاکسازی حافظه موقت (Garbage Collector) با موفقیت فعال شد.")
@@ -1674,13 +1912,13 @@ func main() {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil {
 		log.Fatalf("ساخت پوشه‌ی سوکت (%s) ناموفق بود: %v", filepath.Dir(socketPath), err)
 	}
-	_ = os.Remove(socketPath) 
+	_ = os.Remove(socketPath)
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		log.Fatalf("گوش دادن روی Unix Socket (%s) ناموفق بود: %v", socketPath, err)
 	}
-	
+
 	if grp, err := user.LookupGroup("www-data"); err == nil {
 		if gid, err2 := strconv.Atoi(grp.Gid); err2 == nil {
 			if err3 := os.Chown(socketPath, -1, gid); err3 == nil {
