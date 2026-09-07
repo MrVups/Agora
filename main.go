@@ -830,21 +830,21 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
 	info := fetchPasarGuardUserInfo(token)
 
-	// ذخیره در رم با ۵ دقیقه اعتبار
+	// ذخیره در رم با ۱ دقیقه اعتبار (کاهش از ۵ دقیقه برای واکنش سریع‌تر به تغییر وضعیت اکانت)
 	pgUserInfoCacheLock.Lock()
 	pgUserInfoCache[token] = cachedUserInfo{
 		info:      info,
-		expiresAt: time.Now().Add(5 * time.Minute),
+		expiresAt: time.Now().Add(1 * time.Minute), 
 	}
 	pgUserInfoCacheLock.Unlock()
 
 	return info
 }
 
-// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۱۰ دقیقه
+// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۲ دقیقه
 func startUserInfoCacheGC() {
 	for {
-		time.Sleep(10 * time.Minute)
+		time.Sleep(2 * time.Minute) // کاهش از ۱۰ دقیقه به ۲ دقیقه
 		now := time.Now()
 
 		pgUserInfoCacheLock.Lock()
@@ -979,9 +979,15 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
+	// 🛡️ USER-AGENT PASSTHROUGH & SPOOFING
+	clientUA := r.Header.Get("User-Agent")
+	if strings.TrimSpace(clientUA) == "" {
+		clientUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+	req.Header.Set("User-Agent", clientUA)
+
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
-		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
 	}
 
 	resp, err := client.Do(req)
@@ -1719,9 +1725,15 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
+	// 🛡️ USER-AGENT PASSTHROUGH & SPOOFING
+	clientUA := r.Header.Get("User-Agent")
+	if strings.TrimSpace(clientUA) == "" {
+		clientUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+	req.Header.Set("User-Agent", clientUA)
+
 	if !wantsHTML {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
-		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
 	}
 
 	if cfg.Domain != "" {
