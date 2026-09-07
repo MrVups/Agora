@@ -120,6 +120,7 @@ func initDB() {
 		);`,
 		`CREATE TABLE IF NOT EXISTS cached_configs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			link_id INTEGER NOT NULL DEFAULT 0,
 			inbound_id TEXT,
 			raw_config TEXT
 		);`,
@@ -131,6 +132,7 @@ func initDB() {
 	}
 
 	migrateMainLinksPoolingSchema()
+	migrateCachedConfigsSchema()
 	seedOrMigrateAdminPassword()
 }
 
@@ -178,8 +180,6 @@ func migrateMainLinksPoolingSchema() {
 			continue
 		}
 		if _, err := db.Exec(m.stmt); err != nil {
-			// اگر race یا مهاجرت قبلی باعث شده ستون همزمان اضافه شده باشد،
-			// خطای duplicate column را فقط به‌صورت warning ثبت می‌کنیم.
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 				log.Printf("[DBMigration] ستون %s قبلاً وجود دارد؛ ادامه می‌دهیم.", m.name)
 				continue
@@ -188,6 +188,48 @@ func migrateMainLinksPoolingSchema() {
 			continue
 		}
 		log.Printf("[DBMigration] ستون %s با موفقیت اضافه شد.", m.name)
+	}
+}
+
+func migrateCachedConfigsSchema() {
+	rows, err := db.Query("PRAGMA table_info(cached_configs)")
+	if err != nil {
+		log.Printf("[DBMigration] خواندن schema جدول cached_configs ناموفق بود: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			colType  string
+			notNull  int
+			defaultV interface{}
+			primary  int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primary); err != nil {
+			log.Printf("[DBMigration] خواندن ستون cached_configs ناموفق بود: %v", err)
+			return
+		}
+		existing[name] = true
+	}
+
+	if !existing["link_id"] {
+		if _, err := db.Exec("ALTER TABLE cached_configs ADD COLUMN link_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+				log.Printf("[DBMigration] ستون link_id در cached_configs قبلاً وجود دارد؛ ادامه می‌دهیم.")
+			} else {
+				log.Printf("[DBMigration] افزودن ستون link_id به cached_configs ناموفق بود: %v", err)
+			}
+		} else {
+			log.Printf("[DBMigration] ستون link_id با موفقیت به cached_configs اضافه شد.")
+		}
+	}
+
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_cached_configs_link_id ON cached_configs(link_id)"); err != nil {
+		log.Printf("[DBMigration] ساخت ایندکس idx_cached_configs_link_id ناموفق بود: %v", err)
 	}
 }
 
@@ -440,11 +482,12 @@ func getMD5Hash(text string) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
+// 📌 معماری جدید (Decoupled): Data Ingestion Layer
 func fetchAndCache() {
 	dbLock.Lock()
 	defer dbLock.Unlock()
 
-	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all'), COALESCE(pool_name, ''), COALESCE(rotation_hours, 0) FROM main_links WHERE COALESCE(is_active, 1) = 1")
+	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all') FROM main_links WHERE COALESCE(is_active, 1) = 1")
 	if err != nil {
 		log.Printf("[CronFetch] DB Error: %v", err)
 		return
@@ -455,123 +498,51 @@ func fetchAndCache() {
 		Title         string
 		URL           string
 		TargetInbound string
-		PoolName      string
-		RotationHours int
 	}
 
 	var links []FetchItem
 	for rows.Next() {
 		var item FetchItem
-		if err := rows.Scan(
-			&item.ID,
-			&item.Title,
-			&item.URL,
-			&item.TargetInbound,
-			&item.PoolName,
-			&item.RotationHours,
-		); err == nil {
-			item.PoolName = strings.TrimSpace(item.PoolName)
-			if item.RotationHours < 0 {
-				item.RotationHours = 0
-			}
+		if err := rows.Scan(&item.ID, &item.Title, &item.URL, &item.TargetInbound); err == nil {
 			links = append(links, item)
-		} else {
-			log.Printf("[CronFetch] خواندن لینک از DB ناموفق بود: %v", err)
 		}
 	}
 	rows.Close()
 
-	// انتخاب لینک‌های قابل واکشی:
-	// - لینک بدون pool_name هر بار واکشی می‌شود.
-	// - برای هر target_inbounds + pool_name فقط یک لینک فعال می‌شود.
-	// - rotation_hours موثر، بیشترین مقدار ثبت‌شده در آن pool است؛ در صورت صفر بودن همه، 1 ساعت.
-	type poolKey struct {
-		TargetInbound string
-		PoolName      string
+	if len(links) == 0 {
+		log.Printf("[CronFetch] هیچ لینک فعالی برای واکشی یافت نشد.")
+		return
 	}
 
-	pools := make(map[poolKey][]FetchItem)
-	selectedIDs := make(map[int]bool)
-
-	for _, l := range links {
-		if l.PoolName == "" {
-			continue
-		}
-		key := poolKey{
-			TargetInbound: l.TargetInbound,
-			PoolName:      l.PoolName,
-		}
-		pools[key] = append(pools[key], l)
-	}
-
-	currentUnixHour := time.Now().Unix() / int64(time.Hour/time.Second)
-
-	for key, poolLinks := range pools {
-		sort.SliceStable(poolLinks, func(i, j int) bool {
-			return poolLinks[i].ID < poolLinks[j].ID
-		})
-
-		rotationHours := 1
-		for _, l := range poolLinks {
-			if l.RotationHours > rotationHours {
-				rotationHours = l.RotationHours
-			}
-		}
-		if rotationHours <= 0 {
-			rotationHours = 1
-		}
-
-		windowIndex := (currentUnixHour / int64(rotationHours)) % int64(len(poolLinks))
-		selected := poolLinks[int(windowIndex)]
-		selectedIDs[selected.ID] = true
-
-		log.Printf(
-			"[Pool] target=%q pool=%q size=%d rotation=%dh window=%d selected=%d (%s)",
-			key.TargetInbound,
-			key.PoolName,
-			len(poolLinks),
-			rotationHours,
-			windowIndex,
-			selected.ID,
-			selected.Title,
-		)
-	}
-
-	var linksToFetch []FetchItem
-	for _, l := range links {
-		if l.PoolName == "" || selectedIDs[l.ID] {
-			linksToFetch = append(linksToFetch, l)
-		}
+	type cachedRow struct {
+		LinkID    int
+		InboundID string
+		RawConfig string
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	var allFetchedConfigs [][2]string
+	var allFetchedConfigs []cachedRow
 	seenHashes := make(map[string]bool)
 	successful := 0
 
-	for _, l := range linksToFetch {
+	for _, l := range links {
 		req, reqErr := http.NewRequest("GET", strings.TrimSpace(l.URL), nil)
 		if reqErr != nil {
-			log.Printf("[CronFetch] URL نامعتبر برای '%s': %v", l.Title, reqErr)
 			continue
 		}
 		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
 
 		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("[CronFetch] خطای اتصال به '%s': %v", l.Title, err)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("[CronFetch] لینک '%s' با کد %d پاسخ داد", l.Title, resp.StatusCode)
-			resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
 			continue
 		}
 
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			log.Printf("[CronFetch] خطای خواندن پاسخ '%s': %v", l.Title, readErr)
 			continue
 		}
 
@@ -583,60 +554,116 @@ func fetchAndCache() {
 			if !isValidConfigLine(line) || isInfoOrFakeConfig(line) {
 				continue
 			}
-			hashKey := l.TargetInbound + "_" + getMD5Hash(line)
+			hashKey := fmt.Sprintf("%d_%s", l.ID, getMD5Hash(line))
 			if seenHashes[hashKey] {
 				continue
 			}
 			seenHashes[hashKey] = true
-			allFetchedConfigs = append(allFetchedConfigs, [2]string{l.TargetInbound, line})
+			allFetchedConfigs = append(allFetchedConfigs, cachedRow{LinkID: l.ID, InboundID: l.TargetInbound, RawConfig: line})
 		}
 		successful++
 	}
 
-	if len(allFetchedConfigs) == 0 && len(linksToFetch) > 0 {
-		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری از لینک‌های منتخب دریافت نشد. کش قبلی حفظ می‌شود.")
+	if len(allFetchedConfigs) == 0 && len(links) > 0 {
+		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری دریافت نشد. کش قبلی حفظ می‌شود.")
 		return
 	}
 
 	if _, err := db.Exec("DELETE FROM cached_configs"); err != nil {
-		log.Printf("[CronFetch] خطا در پاکسازی کش قبلی: %v", err)
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		log.Printf("[CronFetch] DB Tx Error: %v", err)
 		return
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO cached_configs (inbound_id, raw_config) VALUES (?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO cached_configs (link_id, inbound_id, raw_config) VALUES (?, ?, ?)")
 	if err != nil {
 		tx.Rollback()
-		log.Printf("[CronFetch] Prepare Error: %v", err)
 		return
 	}
 
 	for _, cfg := range allFetchedConfigs {
-		if _, err := stmt.Exec(cfg[0], cfg[1]); err != nil {
+		if _, err := stmt.Exec(cfg.LinkID, cfg.InboundID, cfg.RawConfig); err != nil {
 			stmt.Close()
 			tx.Rollback()
-			log.Printf("[CronFetch] INSERT cached_configs Error: %v", err)
 			return
 		}
 	}
 	stmt.Close()
+	tx.Commit()
 
-	if err := tx.Commit(); err != nil {
-		log.Printf("[CronFetch] DB Commit Error: %v", err)
-		return
+	log.Printf("[CronFetch] کش به‌روزرسانی شد. %d/%d لینک فعال واکشی شد. %d کانفیگ یکتا (ذخیره با link_id).", successful, len(links), len(allFetchedConfigs))
+}
+
+// 📌 معماری جدید (Decoupled): Real-Time Load Balancer (Serving Layer)
+func getActiveLinkIDsForTargets(targets []string) []int {
+	if len(targets) == 0 {
+		return nil
 	}
 
-	log.Printf(
-		"[CronFetch] کش به‌روزرسانی شد. %d/%d لینک منتخب واکشی شد. %d کانفیگ یکتا.",
-		successful,
-		len(linksToFetch),
-		len(allFetchedConfigs),
-	)
+	placeholders := make([]string, len(targets))
+	args := make([]interface{}, len(targets))
+	for i, t := range targets {
+		placeholders[i] = "?"
+		args[i] = t
+	}
+
+	query := fmt.Sprintf("SELECT id, pool_name, rotation_hours FROM main_links WHERE is_active = 1 AND target_inbounds IN (%s)", strings.Join(placeholders, ","))
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Printf("[LoadBalancer] خطا در خواندن لینک‌ها: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	type linkInfo struct {
+		id       int
+		rotation int
+	}
+
+	pools := make(map[string][]linkInfo)
+	var activeIDs []int
+
+	for rows.Next() {
+		var id, rot int
+		var pool string
+		if err := rows.Scan(&id, &pool, &rot); err == nil {
+			pool = strings.TrimSpace(pool)
+			if pool == "" {
+				activeIDs = append(activeIDs, id) // Standalone link
+			} else {
+				pools[pool] = append(pools[pool], linkInfo{id: id, rotation: rot})
+			}
+		}
+	}
+
+	// Apply Real-time Load Balancing Math for pooled links
+	if len(pools) > 0 {
+		currentUnixMinute := time.Now().Unix() / 60
+		for poolName, links := range pools {
+			sort.SliceStable(links, func(i, j int) bool {
+				return links[i].id < links[j].id
+			})
+
+			maxRot := 1
+			for _, l := range links {
+				if l.rotation > maxRot {
+					maxRot = l.rotation
+				}
+			}
+
+			windowIndex := (currentUnixMinute / int64(maxRot)) % int64(len(links))
+			selectedID := links[windowIndex].id
+			activeIDs = append(activeIDs, selectedID)
+
+			if os.Getenv("SUB_AGG_DEBUG") == "1" {
+				log.Printf("[RealTime-Pool] pool=%q size=%d rot=%dmins selected_link_id=%d", poolName, len(links), maxRot, selectedID)
+			}
+		}
+	}
+	return activeIDs
 }
 
 func syncBotInbound() {
@@ -720,12 +747,29 @@ func getUserInboundID(subID string) int {
 	return inboundID
 }
 
+// 📌 Data Serving: واکشی از انبار کانفیگ بر اساس خروجی Load Balancer در لحظه
 func getCachedConfigsForInbound(inboundID int) []string {
-	rows, err := db.Query("SELECT raw_config FROM cached_configs WHERE inbound_id = ? OR inbound_id = 'all'", strconv.Itoa(inboundID))
+	targets := []string{strconv.Itoa(inboundID), "all"}
+	activeLinkIDs := getActiveLinkIDsForTargets(targets)
+
+	if len(activeLinkIDs) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(activeLinkIDs))
+	args := make([]interface{}, len(activeLinkIDs))
+	for i, id := range activeLinkIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf("SELECT raw_config FROM cached_configs WHERE link_id IN (%s)", strings.Join(placeholders, ","))
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
+
 	var out []string
 	for rows.Next() {
 		var cfg string
@@ -753,21 +797,32 @@ func getCachedConfigsForGroups(groupIDs []int) []string {
 	if len(groupIDs) == 0 {
 		return getCachedConfigsForInbound(-1)
 	}
-	placeholders := make([]string, 0, len(groupIDs)+1)
-	args := make([]interface{}, 0, len(groupIDs)+1)
+	
+	targets := make([]string, 0, len(groupIDs)+1)
 	for _, id := range groupIDs {
-		placeholders = append(placeholders, "?")
-		args = append(args, strconv.Itoa(id))
+		targets = append(targets, strconv.Itoa(id))
 	}
-	placeholders = append(placeholders, "?")
-	args = append(args, "all")
+	targets = append(targets, "all")
 
-	query := "SELECT raw_config FROM cached_configs WHERE inbound_id IN (" + strings.Join(placeholders, ",") + ")"
+	activeLinkIDs := getActiveLinkIDsForTargets(targets)
+	if len(activeLinkIDs) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(activeLinkIDs))
+	args := make([]interface{}, len(activeLinkIDs))
+	for i, id := range activeLinkIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf("SELECT raw_config FROM cached_configs WHERE link_id IN (%s)", strings.Join(placeholders, ","))
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
+
 	var out []string
 	for rows.Next() {
 		var cfg string
@@ -784,7 +839,6 @@ type pasarGuardUserInfo struct {
 	Status    string `json:"status"`
 }
 
-// 📌 پچ جدید (v1.0.5): پیاده‌سازی Smart TTL Cache برای مدیریت بهینه حافظه
 type cachedUserInfo struct {
 	info      *pasarGuardUserInfo
 	expiresAt time.Time
@@ -795,9 +849,7 @@ var (
 	pgUserInfoCacheLock sync.RWMutex
 )
 
-// تابع واکشی اطلاعات با بررسی کش
 func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
-	// بررسی موجود بودن در رم (سرعت نور)
 	pgUserInfoCacheLock.RLock()
 	cached, exists := pgUserInfoCache[token]
 	pgUserInfoCacheLock.RUnlock()
@@ -806,10 +858,8 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 		return cached.info
 	}
 
-	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
 	info := fetchPasarGuardUserInfo(token)
 
-	// ذخیره در رم با ۵ دقیقه اعتبار
 	pgUserInfoCacheLock.Lock()
 	pgUserInfoCache[token] = cachedUserInfo{
 		info:      info,
@@ -820,7 +870,6 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 	return info
 }
 
-// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۱۰ دقیقه
 func startUserInfoCacheGC() {
 	for {
 		time.Sleep(10 * time.Minute)
@@ -907,15 +956,33 @@ func jalaliDayOfPurchase(createdAt string) int {
 	return jd
 }
 
+// 📌 Data Serving for PasarGuard
 func getCachedConfigsForDay(day int) []string {
 	if day <= 0 {
 		return getCachedConfigsForInbound(-1)
 	}
-	rows, err := db.Query("SELECT raw_config FROM cached_configs WHERE inbound_id = ? OR inbound_id = 'all'", strconv.Itoa(day))
+	
+	targets := []string{strconv.Itoa(day), "all"}
+	activeLinkIDs := getActiveLinkIDsForTargets(targets)
+
+	if len(activeLinkIDs) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(activeLinkIDs))
+	args := make([]interface{}, len(activeLinkIDs))
+	for i, id := range activeLinkIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf("SELECT raw_config FROM cached_configs WHERE link_id IN (%s)", strings.Join(placeholders, ","))
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
+
 	var out []string
 	for rows.Next() {
 		var cfg string
@@ -955,7 +1022,6 @@ func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string
 	return htmlStr[:idx] + sb.String() + htmlStr[idx:]
 }
 
-// 📌 Pipeline: PasarGuard Sub Handler
 func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	setNoCacheHeaders(w)
 	if token == "" {
@@ -1003,7 +1069,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
-	// 📌 استفاده از تابع کش شده به جای فراخوانی مستقیم
 	userInfo := getPasarGuardUserInfoCached(token)
 	var purchaseDay int
 	userIsActive := true
@@ -1310,9 +1375,9 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
   <small class="text-muted">لینک‌هایی با نام و اینباند یکسان در یک استخر قرار می‌گیرند.</small>
 </div>
 <div class="col-md-6">
-  <label class="form-label">زمان چرخش به ساعت</label>
-  <input type="number" name="rotation_hours" class="form-control" value="0" min="0" step="1" placeholder="0">
-  <small class="text-muted">۰ یعنی استفاده از مقدار پیش‌فرض ۱ ساعت.</small>
+  <label class="form-label">زمان چرخش (به دقیقه)</label>
+  <input type="number" name="rotation_hours" class="form-control" value="0" min="0" step="1" placeholder="مثلا 300 برای 5 ساعت">
+  <small class="text-muted">۰ یعنی استفاده از مقدار پیش‌فرض ۱ دقیقه.</small>
 </div>
 <div class="col-md-12"><textarea name="urls" class="form-control" rows="3" placeholder="هر لینک در یک خط" required></textarea></div>
 <div class="col-md-12 text-end"><button type="submit" class="btn btn-success px-4">ذخیره و آپدیت کش</button></div>
@@ -1328,7 +1393,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </div>
 <div class="card-body p-0">
 <table class="table table-hover align-middle mb-0">
-<thead><tr><th>#</th><th>عنوان</th><th>URL</th><th>استخر</th><th>چرخش</th><th>وضعیت</th><th>بروزرسانی</th><th>عملیات</th></tr></thead>
+<thead><tr><th>#</th><th>عنوان</th><th>URL</th><th>استخر</th><th>چرخش (دقیقه)</th><th>وضعیت</th><th>بروزرسانی</th><th>عملیات</th></tr></thead>
 <tbody>
 {{range .Links}}
 <tr>
@@ -1344,7 +1409,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </td>
 <td>
 {{if .PoolName}}
-  <span class="badge bg-info text-dark">{{.RotationHours}} ساعت</span>
+  <span class="badge bg-info text-dark">{{.RotationHours}} دقیقه</span>
 {{else}}
   <span class="text-muted">—</span>
 {{end}}
@@ -1377,7 +1442,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 <div class="col-md-12"><label class="form-label">اینباند متصل (ID یا all)</label><input type="text" name="target_inbounds" id="modal_inbounds" class="form-control" required></div>
 <div class="col-md-12"><label class="form-label">آدرس URL</label><input type="url" name="url" id="modal_url" class="form-control" required></div>
 <div class="col-md-6"><label class="form-label">نام دسته/استخر</label><input type="text" name="pool_name" id="modal_pool_name" class="form-control" placeholder="اختیاری"></div>
-<div class="col-md-6"><label class="form-label">زمان چرخش به ساعت</label><input type="number" name="rotation_hours" id="modal_rotation_hours" class="form-control" min="0" step="1" value="0"></div>
+<div class="col-md-6"><label class="form-label">زمان چرخش (به دقیقه)</label><input type="number" name="rotation_hours" id="modal_rotation_hours" class="form-control" min="0" step="1" value="0"></div>
 </div>
 <div class="modal-footer">
 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
@@ -1695,7 +1760,6 @@ func setNoCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Pragma", "no-cache")
 }
 
-// 📌 Pipeline: x-ui Sub Handler
 func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	setNoCacheHeaders(w)
 	if subID == "" {
@@ -1872,7 +1936,6 @@ func main() {
 	if strings.EqualFold(PANEL_TYPE, "pasarguard") {
 		log.Printf("🧩 حالت پنل: PasarGuard (Port=%s Path=%s Scheme=%s)", PASARGUARD_PORT, normalizeURIPath(PASARGUARD_SUB_PATH), PASARGUARD_SCHEME)
 
-		// 📌 پچ جدید: راه‌اندازی Garbage Collector برای پاکسازی خودکار رم
 		go startUserInfoCacheGC()
 		log.Printf("🧹 پردازشگر پاکسازی حافظه موقت (Garbage Collector) با موفقیت فعال شد.")
 
