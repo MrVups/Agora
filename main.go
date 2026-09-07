@@ -96,8 +96,13 @@ func initDB() {
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
-	// 📌 Clean up the ephemeral cache table to safely apply the new link_id schema
-	_, _ = db.Exec("DROP TABLE IF EXISTS cached_configs")
+	// Smart Migration for cached_configs to include link_id without manual drop
+	var hasLinkID bool
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('cached_configs') WHERE name='link_id'").Scan(&hasLinkID)
+	if err == nil && !hasLinkID {
+		log.Printf("[DBMigration] ساختار انبار قدیمی است. در حال بروزرسانی جدول کش (اضافه کردن link_id)...")
+		_, _ = db.Exec("DROP TABLE IF EXISTS cached_configs")
+	}
 
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS main_links (
@@ -183,7 +188,6 @@ func migrateMainLinksPoolingSchema() {
 		}
 		if _, err := db.Exec(m.stmt); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-				log.Printf("[DBMigration] ستون %s قبلاً وجود دارد؛ ادامه می‌دهیم.", m.name)
 				continue
 			}
 			log.Printf("[DBMigration] افزودن ستون %s ناموفق بود: %v", m.name, err)
@@ -442,12 +446,11 @@ func getMD5Hash(text string) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-// 📌 Data Ingestion Layer: This acts as a dumb worker. It fetches everything every X minutes.
+// 📌 Data Ingestion Layer: This acts as a dumb worker. It fetches everything every X minutes without executing rotation math.
 func fetchAndCache() {
 	dbLock.Lock()
 	defer dbLock.Unlock()
 
-	// Fetch ALL active links regardless of pool or rotation
 	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all') FROM main_links WHERE COALESCE(is_active, 1) = 1")
 	if err != nil {
 		log.Printf("[CronFetch] DB Error: %v", err)
@@ -466,8 +469,6 @@ func fetchAndCache() {
 		var item FetchItem
 		if err := rows.Scan(&item.ID, &item.Title, &item.URL, &item.TargetInbound); err == nil {
 			linksToFetch = append(linksToFetch, item)
-		} else {
-			log.Printf("[CronFetch] خواندن لینک از DB ناموفق بود: %v", err)
 		}
 	}
 	rows.Close()
@@ -489,7 +490,11 @@ func fetchAndCache() {
 			log.Printf("[CronFetch] URL نامعتبر برای '%s': %v", l.Title, reqErr)
 			continue
 		}
-		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
+		
+		// 🛡️ USER-AGENT SPOOFING: جعل کردن درخواست برای عبور از کلودفلر و فایروال‌ها
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9,fa;q=0.8")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -517,7 +522,7 @@ func fetchAndCache() {
 			if !isValidConfigLine(line) || isInfoOrFakeConfig(line) {
 				continue
 			}
-			// Incorporate LinkID into HashKey to prevent identical configs from different links replacing each other
+			// جلوگیری از اختلال هش‌های تکراری با اضافه کردن LinkID به امضای کش
 			hashKey := strconv.Itoa(l.ID) + "_" + l.TargetInbound + "_" + getMD5Hash(line)
 			if seenHashes[hashKey] {
 				continue
@@ -529,7 +534,7 @@ func fetchAndCache() {
 	}
 
 	if len(allFetchedConfigs) == 0 && len(linksToFetch) > 0 {
-		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری از لینک‌های منتخب دریافت نشد. کش قبلی حفظ می‌شود.")
+		log.Printf("[CronFetch] هشدار: هیچ کانفیگ معتبری در این دوره واکشی نشد. کش قبلی حفظ می‌شود.")
 		return
 	}
 
@@ -567,7 +572,7 @@ func fetchAndCache() {
 	}
 
 	log.Printf(
-		"[CronFetch] کش به‌روزرسانی شد. %d/%d لینک فعال واکشی شد. %d کانفیگ در انبار ذخیره شد.",
+		"[CronFetch] کش به‌روزرسانی شد. %d/%d لینک فعال در انبار ذخیره شدند (%d کانفیگ کل).",
 		successful,
 		len(linksToFetch),
 		len(allFetchedConfigs),
@@ -655,7 +660,7 @@ func getUserInboundID(subID string) int {
 	return inboundID
 }
 
-// 📌 Data Serving Layer: Evaluates dynamic load balancing on-the-fly
+// 📌 Data Serving Layer: Evaluates dynamic load balancing on-the-fly when the user requests their configs
 func getActiveLinkIDsForTargets(targets []string) []int {
 	if len(targets) == 0 {
 		return nil
@@ -691,7 +696,7 @@ func getActiveLinkIDsForTargets(targets []string) []int {
 				standalone = append(standalone, id)
 			} else {
 				if rot <= 0 {
-					rot = 1 // Fallback to 1 minute
+					rot = 1 // Fallback to 1 minute if user put 0
 				}
 				pools[pool] = append(pools[pool], linkMeta{ID: id, RotationMins: rot})
 			}
@@ -1189,7 +1194,7 @@ type LinkRow struct {
 	URL           string
 	Inbounds      string
 	PoolName      string
-	RotationMins  int
+	RotationHours int
 	Active        bool
 	Updated       string
 }
@@ -1341,7 +1346,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </td>
 <td>
 {{if .PoolName}}
-  <span class="badge bg-info text-dark">{{.RotationMins}} دقیقه</span>
+  <span class="badge bg-info text-dark">{{.RotationHours}} دقیقه</span>
 {{else}}
   <span class="text-muted">—</span>
 {{end}}
@@ -1349,7 +1354,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 <td>{{if .Active}}<span class="badge bg-success">فعال</span>{{else}}<span class="badge bg-secondary">غیرفعال</span>{{end}}</td>
 <td><small>{{.Updated}}</small></td>
 <td>
-<button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="openEditModal({{.ID}}, {{.Title}}, {{.URL}}, {{.Inbounds}}, {{.PoolName}}, {{.RotationMins}})">ویرایش</button>
+<button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="openEditModal({{.ID}}, {{.Title}}, {{.URL}}, {{.Inbounds}}, {{.PoolName}}, {{.RotationHours}})">ویرایش</button>
 <form method="post" action="/aggr-console/toggle/{{.ID}}" style="display:inline"><button type="submit" class="btn btn-sm btn-outline-warning me-1">تغییر وضعیت</button></form>
 <form method="post" action="/aggr-console/delete/{{.ID}}" onsubmit="return confirm('حذف شود؟')" style="display:inline"><button type="submit" class="btn btn-sm btn-outline-danger">حذف</button></form>
 </td>
@@ -1431,7 +1436,7 @@ func renderConsole(w http.ResponseWriter, username string) {
 		for rows.Next() {
 			var l LinkRow
 			var active int
-			if err := rows.Scan(&l.ID, &l.Title, &l.URL, &l.Inbounds, &l.PoolName, &l.RotationMins, &active, &l.Updated); err != nil {
+			if err := rows.Scan(&l.ID, &l.Title, &l.URL, &l.Inbounds, &l.PoolName, &l.RotationHours, &active, &l.Updated); err != nil {
 				continue
 			}
 			l.Active = active != 0
