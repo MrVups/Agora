@@ -96,14 +96,6 @@ func initDB() {
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
-	// 🛠️ BUG FIX: Use 'int' instead of 'bool' for COUNT(*) scan in Go
-	var linkIdCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('cached_configs') WHERE name='link_id'").Scan(&linkIdCount)
-	if err == nil && linkIdCount == 0 {
-		log.Printf("[DBMigration] ساختار انبار قدیمی است. در حال بروزرسانی جدول کش (اضافه کردن link_id)...")
-		_, _ = db.Exec("DROP TABLE IF EXISTS cached_configs")
-	}
-
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS main_links (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +120,7 @@ func initDB() {
 		);`,
 		`CREATE TABLE IF NOT EXISTS cached_configs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			link_id INTEGER,
+			link_id INTEGER DEFAULT 0,
 			inbound_id TEXT,
 			raw_config TEXT
 		);`,
@@ -136,6 +128,19 @@ func initDB() {
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
 			log.Printf("DB Init Table Error: %v", err)
+		}
+	}
+
+	// 🛠️ BUG FIX & SAFE MIGRATION: Use int and ALTER TABLE to avoid losing any schema/data
+	var linkIdCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('cached_configs') WHERE name='link_id'").Scan(&linkIdCount)
+	if err == nil && linkIdCount == 0 {
+		log.Printf("[DBMigration] ساختار انبار قدیمی است. در حال بروزرسانی جدول کش به روش امن (ALTER TABLE)...")
+		_, err = db.Exec("ALTER TABLE cached_configs ADD COLUMN link_id INTEGER DEFAULT 0")
+		if err != nil {
+			log.Printf("[DBMigration] ارور در اضافه کردن ستون: %v", err)
+		} else {
+			log.Printf("[DBMigration] ستون link_id با موفقیت به انبار اضافه شد.")
 		}
 	}
 
@@ -319,6 +324,8 @@ func isInfoOrFakeConfig(line string) bool {
 	return false
 }
 
+// 📌 Pipeline: Canonical Architecture Functions
+
 func looksLikeHTMLResponse(body []byte, contentType string) bool {
 	ct := strings.ToLower(contentType)
 	trimmed := strings.TrimSpace(string(body))
@@ -444,6 +451,7 @@ func getMD5Hash(text string) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
+// 📌 Data Ingestion Layer: This acts as a dumb worker. It fetches everything every X minutes without executing rotation math.
 func fetchAndCache() {
 	dbLock.Lock()
 	defer dbLock.Unlock()
@@ -488,9 +496,9 @@ func fetchAndCache() {
 			continue
 		}
 		
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9,fa;q=0.8")
+		// 🛡️ VPN CLIENT SPOOFING: جعل کردن درخواست به عنوان کلاینت V2rayNG برای استخراج کانفیگ خام از پنل‌های هوشمند
+		req.Header.Set("User-Agent", "v2rayNG/1.8.12")
+		// با عدم ارسال Accept هدرهای اضافی، دقیقاً مشابه رفتار کلاینت واقعی عمل می‌کنیم
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -518,6 +526,7 @@ func fetchAndCache() {
 			if !isValidConfigLine(line) || isInfoOrFakeConfig(line) {
 				continue
 			}
+			// جلوگیری از اختلال هش‌های تکراری با اضافه کردن LinkID به امضای کش
 			hashKey := strconv.Itoa(l.ID) + "_" + l.TargetInbound + "_" + getMD5Hash(line)
 			if seenHashes[hashKey] {
 				continue
@@ -655,6 +664,7 @@ func getUserInboundID(subID string) int {
 	return inboundID
 }
 
+// 📌 Data Serving Layer: Evaluates dynamic load balancing on-the-fly when the user requests their configs
 func getActiveLinkIDsForTargets(targets []string) []int {
 	if len(targets) == 0 {
 		return nil
@@ -690,7 +700,7 @@ func getActiveLinkIDsForTargets(targets []string) []int {
 				standalone = append(standalone, id)
 			} else {
 				if rot <= 0 {
-					rot = 1 
+					rot = 1 // Fallback to 1 minute if user put 0
 				}
 				pools[pool] = append(pools[pool], linkMeta{ID: id, RotationMins: rot})
 			}
@@ -799,6 +809,7 @@ type pasarGuardUserInfo struct {
 	Status    string `json:"status"`
 }
 
+// 📌 پچ جدید: پیاده‌سازی Smart TTL Cache برای مدیریت بهینه حافظه
 type cachedUserInfo struct {
 	info      *pasarGuardUserInfo
 	expiresAt time.Time
@@ -809,7 +820,9 @@ var (
 	pgUserInfoCacheLock sync.RWMutex
 )
 
+// تابع واکشی اطلاعات با بررسی کش
 func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
+	// بررسی موجود بودن در رم (سرعت نور)
 	pgUserInfoCacheLock.RLock()
 	cached, exists := pgUserInfoCache[token]
 	pgUserInfoCacheLock.RUnlock()
@@ -818,21 +831,24 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 		return cached.info
 	}
 
+	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
 	info := fetchPasarGuardUserInfo(token)
 
+	// ذخیره در رم با ۳۰ ثانیه اعتبار برای واکنش سریع به وضعیت فعال/غیرفعال کاربر
 	pgUserInfoCacheLock.Lock()
 	pgUserInfoCache[token] = cachedUserInfo{
 		info:      info,
-		expiresAt: time.Now().Add(1 * time.Minute), 
+		expiresAt: time.Now().Add(30 * time.Second), 
 	}
 	pgUserInfoCacheLock.Unlock()
 
 	return info
 }
 
+// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۳۰ ثانیه
 func startUserInfoCacheGC() {
 	for {
-		time.Sleep(2 * time.Minute) 
+		time.Sleep(30 * time.Second) 
 		now := time.Now()
 
 		pgUserInfoCacheLock.Lock()
@@ -945,6 +961,7 @@ func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string
 	return htmlStr[:idx] + sb.String() + htmlStr[idx:]
 }
 
+// 📌 Pipeline: PasarGuard Sub Handler
 func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	setNoCacheHeaders(w)
 	if token == "" {
@@ -966,6 +983,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
+	// 🛡️ USER-AGENT PASSTHROUGH & SPOOFING
 	clientUA := r.Header.Get("User-Agent")
 	if strings.TrimSpace(clientUA) == "" {
 		clientUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -997,6 +1015,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
+	// 📌 استفاده از تابع کش شده به جای فراخوانی مستقیم
 	userInfo := getPasarGuardUserInfoCached(token)
 	var purchaseDay int
 	userIsActive := true
