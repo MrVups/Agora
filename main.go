@@ -530,7 +530,9 @@ func fetchAndCache() {
 		if reqErr != nil {
 			continue
 		}
-		req.Header.Set("User-Agent", "Go-Sub-Aggregator/1.0")
+		
+		// 🎭 جعل هویت (Spoofing) کلاینت استاندارد برای دور زدن فیلترینگ سرور مادر و دریافت لیست کامل کانفیگ‌ها
+		req.Header.Set("User-Agent", "v2rayNG/1.8.18")
 
 		resp, err := client.Do(req)
 		if err != nil || resp.StatusCode != http.StatusOK {
