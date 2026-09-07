@@ -96,10 +96,10 @@ func initDB() {
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
-	// Smart Migration for cached_configs to include link_id without manual drop
-	var hasLinkID bool
-	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('cached_configs') WHERE name='link_id'").Scan(&hasLinkID)
-	if err == nil && !hasLinkID {
+	// 🛠️ BUG FIX: Use 'int' instead of 'bool' for COUNT(*) scan in Go
+	var linkIdCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('cached_configs') WHERE name='link_id'").Scan(&linkIdCount)
+	if err == nil && linkIdCount == 0 {
 		log.Printf("[DBMigration] ساختار انبار قدیمی است. در حال بروزرسانی جدول کش (اضافه کردن link_id)...")
 		_, _ = db.Exec("DROP TABLE IF EXISTS cached_configs")
 	}
@@ -319,8 +319,6 @@ func isInfoOrFakeConfig(line string) bool {
 	return false
 }
 
-// 📌 Pipeline: Canonical Architecture Functions
-
 func looksLikeHTMLResponse(body []byte, contentType string) bool {
 	ct := strings.ToLower(contentType)
 	trimmed := strings.TrimSpace(string(body))
@@ -446,7 +444,6 @@ func getMD5Hash(text string) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-// 📌 Data Ingestion Layer: This acts as a dumb worker. It fetches everything every X minutes without executing rotation math.
 func fetchAndCache() {
 	dbLock.Lock()
 	defer dbLock.Unlock()
@@ -491,7 +488,6 @@ func fetchAndCache() {
 			continue
 		}
 		
-		// 🛡️ USER-AGENT SPOOFING: جعل کردن درخواست برای عبور از کلودفلر و فایروال‌ها
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9,fa;q=0.8")
@@ -522,7 +518,6 @@ func fetchAndCache() {
 			if !isValidConfigLine(line) || isInfoOrFakeConfig(line) {
 				continue
 			}
-			// جلوگیری از اختلال هش‌های تکراری با اضافه کردن LinkID به امضای کش
 			hashKey := strconv.Itoa(l.ID) + "_" + l.TargetInbound + "_" + getMD5Hash(line)
 			if seenHashes[hashKey] {
 				continue
@@ -660,7 +655,6 @@ func getUserInboundID(subID string) int {
 	return inboundID
 }
 
-// 📌 Data Serving Layer: Evaluates dynamic load balancing on-the-fly when the user requests their configs
 func getActiveLinkIDsForTargets(targets []string) []int {
 	if len(targets) == 0 {
 		return nil
@@ -696,7 +690,7 @@ func getActiveLinkIDsForTargets(targets []string) []int {
 				standalone = append(standalone, id)
 			} else {
 				if rot <= 0 {
-					rot = 1 // Fallback to 1 minute if user put 0
+					rot = 1 
 				}
 				pools[pool] = append(pools[pool], linkMeta{ID: id, RotationMins: rot})
 			}
@@ -805,7 +799,6 @@ type pasarGuardUserInfo struct {
 	Status    string `json:"status"`
 }
 
-// 📌 پچ جدید (v1.0.5): پیاده‌سازی Smart TTL Cache برای مدیریت بهینه حافظه
 type cachedUserInfo struct {
 	info      *pasarGuardUserInfo
 	expiresAt time.Time
@@ -816,9 +809,7 @@ var (
 	pgUserInfoCacheLock sync.RWMutex
 )
 
-// تابع واکشی اطلاعات با بررسی کش
 func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
-	// بررسی موجود بودن در رم (سرعت نور)
 	pgUserInfoCacheLock.RLock()
 	cached, exists := pgUserInfoCache[token]
 	pgUserInfoCacheLock.RUnlock()
@@ -827,10 +818,8 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 		return cached.info
 	}
 
-	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
 	info := fetchPasarGuardUserInfo(token)
 
-	// ذخیره در رم با ۱ دقیقه اعتبار (کاهش از ۵ دقیقه برای واکنش سریع‌تر به تغییر وضعیت اکانت)
 	pgUserInfoCacheLock.Lock()
 	pgUserInfoCache[token] = cachedUserInfo{
 		info:      info,
@@ -841,10 +830,9 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 	return info
 }
 
-// Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۲ دقیقه
 func startUserInfoCacheGC() {
 	for {
-		time.Sleep(2 * time.Minute) // کاهش از ۱۰ دقیقه به ۲ دقیقه
+		time.Sleep(2 * time.Minute) 
 		now := time.Now()
 
 		pgUserInfoCacheLock.Lock()
@@ -957,7 +945,6 @@ func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string
 	return htmlStr[:idx] + sb.String() + htmlStr[idx:]
 }
 
-// 📌 Pipeline: PasarGuard Sub Handler
 func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	setNoCacheHeaders(w)
 	if token == "" {
@@ -979,7 +966,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
-	// 🛡️ USER-AGENT PASSTHROUGH & SPOOFING
 	clientUA := r.Header.Get("User-Agent")
 	if strings.TrimSpace(clientUA) == "" {
 		clientUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -1011,7 +997,6 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
-	// 📌 استفاده از تابع کش شده به جای فراخوانی مستقیم
 	userInfo := getPasarGuardUserInfoCached(token)
 	var purchaseDay int
 	userIsActive := true
