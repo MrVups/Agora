@@ -91,12 +91,39 @@ var (
 func initDB() {
 	_ = os.MkdirAll(filepath.Dir(DB_PATH), 0755)
 	var err error
-	db, err = sql.Open("sqlite3", DB_PATH+"?_journal_mode=WAL")
+
+	// اتصال به دیتابیس با فعال‌سازی امکانات Performance ابری و WAL Mode
+	db, err = sql.Open(
+		"sqlite3",
+		DB_PATH+
+			"?_journal_mode=WAL"+
+			"&_synchronous=NORMAL"+
+			"&_busy_timeout=5000"+
+			"&_temp_store=MEMORY",
+	)
+
 	if err != nil {
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
+	// ============================================================
+	// SQLite Performance / Concurrency PRAGMA
+	// ============================================================
+	pragmaQueries := []string{
+		`PRAGMA journal_mode=WAL;`,
+		`PRAGMA synchronous=NORMAL;`,
+		`PRAGMA busy_timeout=5000;`,
+		`PRAGMA temp_store=MEMORY;`,
+	}
+
+	for _, pragma := range pragmaQueries {
+		if _, err := db.Exec(pragma); err != nil {
+			log.Printf("[SQLite] PRAGMA failed: %s -> %v", pragma, err)
+		}
+	}
+
 	queries := []string{
+		// ---- جداول اصلی سیستم شما ----
 		`CREATE TABLE IF NOT EXISTS main_links (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			title TEXT,
@@ -124,6 +151,37 @@ func initDB() {
 			inbound_id TEXT,
 			raw_config TEXT
 		);`,
+		
+		// ---- جداول اختصاصی سیستم فایروال ----
+		`CREATE TABLE IF NOT EXISTS firewall_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);`,
+		`INSERT OR IGNORE INTO firewall_settings (key, value) VALUES 
+			('firewall_enabled', '1'),
+			('suspicion_threshold', '3'),
+			('max_devices_per_token', '5'),
+			('reset_window_hours', '24'),
+			('gc_interval_hours', '6'),
+			('warning_fake_config', ''),
+			('block_fake_config', '');`,
+		`CREATE TABLE IF NOT EXISTS ip_tracking_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			token TEXT NOT NULL,
+			ip_address TEXT NOT NULL,
+			os_type TEXT NOT NULL,
+			first_seen INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_ip_tracking_token_seen ON ip_tracking_logs(token, first_seen);`,
+		`CREATE INDEX IF NOT EXISTS idx_ip_tracking_first_seen ON ip_tracking_logs(first_seen);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_device ON ip_tracking_logs(token, ip_address, os_type);`,
+		`CREATE TABLE IF NOT EXISTS token_status (
+			token TEXT PRIMARY KEY,
+			is_suspicious INTEGER NOT NULL DEFAULT 0,
+			admin_warn_mode INTEGER NOT NULL DEFAULT 0,
+			admin_burn_mode INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_token_status_token ON token_status(token);`,
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
@@ -969,6 +1027,22 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		return
 	}
 
+	// ============================================================
+	// 🛡️ Firewall Hook
+	// MUST run before contacting PasarGuard upstream.
+	// ============================================================
+	firewallDecision := FirewallCheck(r, token)
+	if !firewallDecision.Allow {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		blockConfig := strings.TrimSpace(firewallDecision.BlockConfig)
+		if blockConfig == "" {
+			blockConfig = "SUBSCRIPTION_BLOCKED"
+		}
+		_, _ = w.Write([]byte(blockConfig))
+		return
+	}
+
 	upstreamURL := fmt.Sprintf("%s://127.0.0.1:%s%s%s", PASARGUARD_SCHEME, PASARGUARD_PORT, PASARGUARD_SUB_PATH, token)
 	client := &http.Client{Timeout: 8 * time.Second}
 	req, _ := http.NewRequest("GET", upstreamURL, nil)
@@ -1033,6 +1107,11 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		extraConfigs = getCachedConfigsForDay(purchaseDay)
 	}
 
+	// 🛡️ [کد جدید]: افزودن هشدار فایروال به کانفیگ‌های اضافه، قبل از بررسی HTML
+	if firewallDecision.AdminWarn && strings.TrimSpace(firewallDecision.WarningConfig) != "" {
+		extraConfigs = append(extraConfigs, strings.TrimSpace(firewallDecision.WarningConfig))
+	}
+
 	ct := resp.Header.Get("Content-Type")
 	isHTML := looksLikeHTMLResponse(bodyBytes, ct)
 
@@ -1054,6 +1133,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 
 	configs = append(configs, extraConfigs...)
+
 
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
 
@@ -1222,6 +1302,20 @@ type SchedRow struct {
 	ValidTo   string
 }
 
+// 🛡️ Struct های مربوط به پنل Firewall
+type FirewallSuspiciousRow struct {
+	Token       string
+	Suspicious  bool
+	AdminWarn   bool
+	AdminBurn   bool
+	DeviceCount int
+}
+
+type FirewallConsoleData struct {
+	Settings   FirewallSettings
+	Suspicious []FirewallSuspiciousRow
+}
+
 type ConsoleData struct {
 	Username     string
 	Groups       []LinkGroup
@@ -1231,6 +1325,58 @@ type ConsoleData struct {
 	PGGroups     []pgGroupSimple
 	PanelLabel   string
 	DayOptions   []int
+	Firewall     FirewallConsoleData // 🛡️ اضافه شدن فایروال به Data
+}
+
+// 🛡️ توابع Helper پنل فایروال
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func getSuspiciousFirewallTokens() []FirewallSuspiciousRow {
+	if db == nil {
+		return nil
+	}
+
+	rows, err := db.Query(`
+		SELECT 
+			t.token, 
+			t.is_suspicious, 
+			t.admin_warn_mode, 
+			t.admin_burn_mode, 
+			COUNT(l.id)
+		FROM token_status t
+		LEFT JOIN ip_tracking_logs l ON t.token = l.token
+		WHERE t.is_suspicious = 1
+		GROUP BY t.token
+		ORDER BY t.token ASC
+	`)
+	if err != nil {
+		log.Printf("[FirewallConsole] suspicious query failed: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var result []FirewallSuspiciousRow
+
+	for rows.Next() {
+		var token string
+		var suspicious, warn, burn, deviceCount int
+
+		if err := rows.Scan(&token, &suspicious, &warn, &burn, &deviceCount); err == nil {
+			result = append(result, FirewallSuspiciousRow{
+				Token:       token,
+				Suspicious:  suspicious != 0,
+				AdminWarn:   warn != 0,
+				AdminBurn:   burn != 0,
+				DeviceCount: deviceCount,
+			})
+		}
+	}
+	return result
 }
 
 const consoleTmpl = `<!DOCTYPE html>
@@ -1257,6 +1403,123 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 <span class="badge bg-secondary me-2">پنل: {{.PanelLabel}}</span>
 <span class="badge bg-dark">کاربر: {{.Username}}</span>
 </div>
+</div>
+
+<!-- ============================================================
+     FIREWALL SETTINGS
+     ============================================================ -->
+<div class="card p-4 mb-4 shadow-sm border-start border-4 border-danger" id="firewall">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h4 class="mb-1">🛡️ Firewall & Anti-Sharing IDS</h4>
+            <small class="text-muted">
+                کنترل اتصال، تشخیص دستگاه‌های جدید و مدیریت توکن‌های مشکوک
+            </small>
+        </div>
+        {{if .Firewall.Settings.Enabled}}
+            <span class="badge bg-success fs-6">فعال</span>
+        {{else}}
+            <span class="badge bg-secondary fs-6">خاموش</span>
+        {{end}}
+    </div>
+    <form method="post" action="/aggr-console/firewall/settings" class="row g-3">
+        <div class="col-md-3">
+            <label class="form-label">وضعیت فایروال</label>
+            <select name="firewall_enabled" class="form-select">
+                {{if .Firewall.Settings.Enabled}}
+                    <option value="1" selected>روشن</option>
+                    <option value="0">خاموش</option>
+                {{else}}
+                    <option value="1">روشن</option>
+                    <option value="0" selected>خاموش</option>
+                {{end}}
+            </select>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">آستانه مشکوک بودن</label>
+            <input type="number" name="suspicion_threshold" class="form-control" min="1" value="{{.Firewall.Settings.SuspicionThreshold}}" required>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">سقف دستگاه</label>
+            <input type="number" name="max_devices_per_token" class="form-control" min="2" value="{{.Firewall.Settings.MaxDevices}}" required>
+            <small class="text-muted">باید بیشتر از آستانه مشکوک بودن باشد.</small>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">بازه اعتبار اتصال (ساعت)</label>
+            <input type="number" name="reset_window_hours" class="form-control" min="1" value="{{.Firewall.Settings.ResetWindowHours}}" required>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label">فاصله GC (ساعت)</label>
+            <input type="number" name="gc_interval_hours" class="form-control" min="1" value="{{.Firewall.Settings.GCIntervalHours}}" required>
+        </div>
+        <div class="col-md-9"></div>
+        <div class="col-md-6">
+            <label class="form-label">⚠️ کانفیگ هشدار مشکوک</label>
+            <textarea name="warning_fake_config" class="form-control" rows="4" placeholder="کانفیگ نمایشی هشدار...">{{.Firewall.Settings.WarningFakeConfig}}</textarea>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label">🚫 کانفیگ انسداد کامل</label>
+            <textarea name="block_fake_config" class="form-control" rows="4" placeholder="کانفیگ نمایشی هنگام Block...">{{.Firewall.Settings.BlockFakeConfig}}</textarea>
+        </div>
+        <div class="col-12 text-end">
+            <button type="submit" class="btn btn-danger px-4">💾 ذخیره تنظیمات Firewall</button>
+        </div>
+    </form>
+</div>
+
+<!-- ============================================================
+     SUSPICIOUS TOKENS DASHBOARD
+     ============================================================ -->
+<div class="card p-4 mb-4 shadow-sm border-start border-4 border-warning">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h4 class="mb-1">🚨 توکن‌های مشکوک</h4>
+            <small class="text-muted">مدیریت فوری Warning و Burn بدون Reload صفحه</small>
+        </div>
+        <span class="badge bg-warning text-dark">{{len .Firewall.Suspicious}} مورد</span>
+    </div>
+    <div id="firewall-alert" class="alert d-none" role="alert"></div>
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Token</th>
+                    <th>دستگاه‌ها</th>
+                    <th>وضعیت</th>
+                    <th>عملیات</th>
+                </tr>
+            </thead>
+            <tbody>
+            {{range $i, $row := .Firewall.Suspicious}}
+                <tr id="firewall-row-{{$i}}">
+                    <td><strong>{{$i | printf "%d"}}</strong></td>
+                    <td><code style="word-break:break-all;">{{$row.Token}}</code></td>
+                    <td><span class="badge bg-secondary">{{$row.DeviceCount}}</span></td>
+                    <td class="firewall-status-cell">
+                        {{if $row.AdminBurn}}
+                            <span class="badge bg-danger">🔥 Burn</span>
+                        {{else if $row.AdminWarn}}
+                            <span class="badge bg-warning text-dark">⚠️ Warning</span>
+                        {{else}}
+                            <span class="badge bg-warning text-dark">🚨 مشکوک</span>
+                        {{end}}
+                    </td>
+                    <td>
+                        <div class="btn-group" role="group">
+                            <button type="button" class="btn btn-sm btn-outline-warning" onclick="firewallWarn('{{js $row.Token}}', {{$i}})">⚠️ هشدار</button>
+                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="firewallBurn('{{js $row.Token}}', {{$i}})">🔥 قطع کامل</button>
+                        </div>
+                    </td>
+                </tr>
+            {{else}}
+                <tr>
+                    <td colspan="5" class="text-center text-muted py-4">✅ فعلاً توکن مشکوکی ثبت نشده است.</td>
+                </tr>
+            {{end}}
+            </tbody>
+        </table>
+    </div>
 </div>
 
 {{if not .IsPasarGuard}}
@@ -1433,6 +1696,64 @@ function openEditModal(id, title, url, inbounds, poolName, rotationHours) {
 	var myModal = new bootstrap.Modal(document.getElementById('editModal'));
 	myModal.show();
 }
+
+// ============================================================
+// AJAX Functions for Firewall Dashboard
+// ============================================================
+function showFirewallAlert(message, success) {
+    const box = document.getElementById('firewall-alert');
+    if (!box) return;
+    box.classList.remove('d-none');
+    box.className = 'alert ' + (success ? 'alert-success' : 'alert-danger');
+    box.textContent = message;
+    window.clearTimeout(window.firewallAlertTimer);
+    window.firewallAlertTimer = window.setTimeout(function () {
+        box.classList.add('d-none');
+    }, 3500);
+}
+
+async function firewallPost(url, token, rowIndex, mode) {
+    const formData = new URLSearchParams();
+    formData.set('token', token);
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: formData.toString()
+        });
+        const text = await response.text();
+        if (!response.ok) throw new Error(text || 'Request failed');
+        let data = null;
+        try { data = JSON.parse(text); } catch (_) {}
+        if (!data || !data.ok) throw new Error('عملیات توسط سرور تأیید نشد.');
+
+        const row = document.getElementById('firewall-row-' + rowIndex);
+        if (row) {
+            const statusCell = row.querySelector('.firewall-status-cell');
+            if (statusCell) {
+                if (mode === 'burn') {
+                    statusCell.innerHTML = '<span class="badge bg-danger">🔥 Burn</span>';
+                } else {
+                    statusCell.innerHTML = '<span class="badge bg-warning text-dark">⚠️ Warning</span>';
+                }
+            }
+        }
+        showFirewallAlert(mode === 'burn' ? 'اتصالات این توکن کاملاً قطع شد.' : 'حالت هشدار برای این توکن فعال شد.', true);
+    } catch (error) {
+        console.error('[Firewall]', error);
+        showFirewallAlert('اجرای عملیات ناموفق بود.', false);
+    }
+}
+
+function firewallWarn(token, rowIndex) {
+    if (!confirm('حالت هشدار برای این توکن فعال شود؟')) return;
+    firewallPost('/aggr-console/firewall/warn', token, rowIndex, 'warn');
+}
+
+function firewallBurn(token, rowIndex) {
+    if (!confirm('آیا از قطع کامل اتصالات این توکن مطمئن هستید؟')) return;
+    firewallPost('/aggr-console/firewall/burn', token, rowIndex, 'burn');
+}
 </script>
 </body>
 </html>`
@@ -1506,6 +1827,12 @@ func renderConsole(w http.ResponseWriter, username string) {
 		categories = getBotCategories()
 	}
 
+	// 🛡️ ایجاد داده‌های مربوط به فایروال برای تزریق به پنل HTML
+	firewallData := FirewallConsoleData{
+		Settings:   getFirewallSettings(),
+		Suspicious: getSuspiciousFirewallTokens(),
+	}
+
 	data := ConsoleData{
 		Username:     username,
 		Groups:       groups,
@@ -1515,21 +1842,48 @@ func renderConsole(w http.ResponseWriter, username string) {
 		PGGroups:     pgGroups,
 		PanelLabel:   panelLabel,
 		DayOptions:   dayOptions,
+		Firewall:     firewallData,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.Execute(w, data)
 }
 
 func checkCSRF(r *http.Request) bool {
-	host := r.Host
-	if host == "" {
+	requestHost := strings.TrimSpace(r.Host)
+	if requestHost == "" {
 		return false
 	}
+
+	if parsedHost, err := url.Parse("http://" + requestHost); err == nil && parsedHost.Hostname() != "" {
+		requestHost = strings.ToLower(parsedHost.Hostname())
+	} else {
+		requestHost = strings.ToLower(strings.TrimSpace(requestHost))
+	}
+	if requestHost == "" {
+		return false
+	}
+
+	originMatches := func(raw string) bool {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return false
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" {
+			return false
+		}
+		hostname := strings.ToLower(strings.TrimSpace(u.Hostname()))
+		if hostname == requestHost {
+			return true
+		}
+		return strings.HasSuffix(hostname, "."+requestHost)
+	}
+
 	if o := r.Header.Get("Origin"); o != "" {
-		return strings.Contains(o, host)
+		return originMatches(o)
 	}
 	if ref := r.Header.Get("Referer"); ref != "" {
-		return strings.Contains(ref, host)
+		return originMatches(ref)
 	}
 	return false
 }
@@ -1546,6 +1900,98 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	// ============================================================
+	// 🛡️ API Endpoints for Firewall
+	// ============================================================
+	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/settings":
+		enabled := parseBool(r.FormValue("firewall_enabled"))
+		suspicionThreshold := parseInt(r.FormValue("suspicion_threshold"), 3)
+		maxDevices := parseInt(r.FormValue("max_devices_per_token"), 5)
+		resetWindowHours := parseInt(r.FormValue("reset_window_hours"), 24)
+		gcIntervalHours := parseInt(r.FormValue("gc_interval_hours"), 6)
+
+		if maxDevices <= suspicionThreshold {
+			http.Error(w, "سقف دستگاه باید بیشتر از آستانه مشکوک بودن باشد", http.StatusBadRequest)
+			return
+		}
+
+		warningConfig := strings.TrimSpace(r.FormValue("warning_fake_config"))
+		blockConfig := strings.TrimSpace(r.FormValue("block_fake_config"))
+
+		settings := map[string]string{
+			"firewall_enabled":      strconv.Itoa(boolToInt(enabled)),
+			"suspicion_threshold":   strconv.Itoa(suspicionThreshold),
+			"max_devices_per_token": strconv.Itoa(maxDevices),
+			"reset_window_hours":    strconv.Itoa(resetWindowHours),
+			"gc_interval_hours":     strconv.Itoa(gcIntervalHours),
+			"warning_fake_config":   warningConfig,
+			"block_fake_config":     blockConfig,
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("[FirewallConsole] begin settings transaction failed: %v", err)
+			http.Error(w, "خطا در دیتابیس", http.StatusInternalServerError)
+			return
+		}
+
+		settingsSaved := true
+		for key, value := range settings {
+			if _, err := tx.Exec(`
+				INSERT INTO firewall_settings(key, value)
+				VALUES (?, ?)
+				ON CONFLICT(key) DO UPDATE SET value = excluded.value
+			`, key, value); err != nil {
+				log.Printf("[FirewallConsole] save setting %s failed: %v", key, err)
+				settingsSaved = false
+				break
+			}
+		}
+
+		if !settingsSaved {
+			_ = tx.Rollback()
+			http.Error(w, "خطا در ذخیره تنظیمات Firewall", http.StatusInternalServerError)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("[FirewallConsole] commit settings transaction failed: %v", err)
+			http.Error(w, "خطا در دیتابیس", http.StatusInternalServerError)
+			return
+		}
+
+		InvalidateFirewallSettingsCache()
+		http.Redirect(w, r, "/aggr-console#firewall", http.StatusSeeOther)
+
+	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/warn":
+		token := strings.TrimSpace(r.FormValue("token"))
+		if token == "" {
+			http.Error(w, "token is required", http.StatusBadRequest)
+			return
+		}
+		if err := setFirewallWarning(token, true); err != nil {
+			http.Error(w, "خطا در فعال‌سازی حالت هشدار", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true,"mode":"warn"}`))
+
+	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/burn":
+		token := strings.TrimSpace(r.FormValue("token"))
+		if token == "" {
+			http.Error(w, "token is required", http.StatusBadRequest)
+			return
+		}
+		if err := setFirewallBurn(token, true); err != nil {
+			http.Error(w, "خطا در قطع کامل اتصالات", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true,"mode":"burn"}`))
+
+	// ============================================================
+	// سایر Endpoints
+	// ============================================================
 	case r.Method == "POST" && r.URL.Path == "/aggr-console/add":
 		title := strings.TrimSpace(r.FormValue("title"))
 		urls := r.FormValue("urls")
@@ -1715,6 +2161,22 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		return
 	}
 
+	// ============================================================
+	// 🛡️ Firewall Hook
+	// MUST run before contacting Upstream.
+	// ============================================================
+	firewallDecision := FirewallCheck(r, subID)
+	if !firewallDecision.Allow {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		blockConfig := strings.TrimSpace(firewallDecision.BlockConfig)
+		if blockConfig == "" {
+			blockConfig = "SUBSCRIPTION_BLOCKED"
+		}
+		_, _ = w.Write([]byte(blockConfig))
+		return
+	}
+
 	cfg := getXUIConfig()
 	sanaeiURL := fmt.Sprintf("https://127.0.0.1:%s%s%s", cfg.Port, cfg.Path, subID)
 	req, _ := http.NewRequest("GET", sanaeiURL, nil)
@@ -1766,6 +2228,11 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	userInboundID := getUserInboundID(subID)
 	extraConfigs := getCachedConfigsForInbound(userInboundID)
 
+	// 🛡️ [کد جدید]: افزودن هشدار فایروال قبل از خروجی HTML
+	if firewallDecision.AdminWarn && strings.TrimSpace(firewallDecision.WarningConfig) != "" {
+		extraConfigs = append(extraConfigs, strings.TrimSpace(firewallDecision.WarningConfig))
+	}
+
 	ct := resp.Header.Get("Content-Type")
 	isHTML := looksLikeHTMLResponse(bodyBytes, ct)
 
@@ -1786,6 +2253,8 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		configs = strings.Split(payloadText, "\n")
 	}
 	configs = append(configs, extraConfigs...)
+
+	
 
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
 
@@ -1884,6 +2353,10 @@ func main() {
 
 	initDB()
 	initMySQLDB()
+
+	// 🔐 Anti-Sharing Firewall background collector
+	StartFirewallGC()
+	log.Printf("🛡️ Firewall Anti-Sharing GC started.")
 
 	PANEL_TYPE = detectPanelType()
 
