@@ -49,6 +49,12 @@ type firewallStatus struct {
 	Burn       bool
 }
 
+type FirewallDeviceLogRow struct {
+	IP        string
+	OS        string
+	FirstSeen string
+}
+
 type firewallStatusCacheItem struct {
 	Status   firewallStatus
 	Expire   time.Time
@@ -503,6 +509,100 @@ func setFirewallFlag(token, flag string, enabled bool) error {
 		invalidateFirewallStatus(token)
 	}
 	return err
+}
+
+func toggleFirewallWarning(token string) (bool, error) {
+	if db == nil {
+		return false, sql.ErrConnDone
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false, sql.ErrNoRows
+	}
+
+	if _, err := db.Exec(`
+		INSERT OR IGNORE INTO token_status(token,is_suspicious,admin_warn_mode,admin_burn_mode)
+		VALUES (?,0,0,0)
+	`, token); err != nil {
+		return false, err
+	}
+
+	var current int
+	if err := db.QueryRow("SELECT admin_warn_mode FROM token_status WHERE token = ?", token).Scan(&current); err != nil {
+		return false, err
+	}
+
+	newState := current == 0
+	if err := setFirewallWarning(token, newState); err != nil {
+		return false, err
+	}
+	return newState, nil
+}
+
+func resetFirewallToken(token string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return sql.ErrNoRows
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("DELETE FROM ip_tracking_logs WHERE token = ?", token); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE token_status
+		SET is_suspicious = 0, admin_warn_mode = 0, admin_burn_mode = 0
+		WHERE token = ?
+	`, token); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	invalidateFirewallStatus(token)
+	return nil
+}
+
+func getFirewallTokenDevices(token string) []FirewallDeviceLogRow {
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(`
+		SELECT ip_address, os_type, first_seen
+		FROM ip_tracking_logs
+		WHERE token = ?
+		ORDER BY first_seen DESC
+	`, token)
+	if err != nil {
+		log.Printf("[FirewallConsole] device history query failed: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var out []FirewallDeviceLogRow
+	for rows.Next() {
+		var ip, osType string
+		var firstSeen int64
+		if err := rows.Scan(&ip, &osType, &firstSeen); err == nil {
+			out = append(out, FirewallDeviceLogRow{
+				IP:        ip,
+				OS:        osType,
+				FirstSeen: time.Unix(firstSeen, 0).Format("2006-01-02 15:04:05"),
+			})
+		}
+	}
+	return out
 }
 
 func extractClientIP(r *http.Request) string {

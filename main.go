@@ -903,6 +903,17 @@ func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
 	return info
 }
 
+// 📌 خواندن read-only از کش، بدون هیچ فراخوانی شبکه‌ای (برای مسیرهای رندر مثل پنل ادمین)
+func getPasarGuardUserInfoIfCached(token string) *pasarGuardUserInfo {
+	pgUserInfoCacheLock.RLock()
+	defer pgUserInfoCacheLock.RUnlock()
+	cached, exists := pgUserInfoCache[token]
+	if !exists {
+		return nil
+	}
+	return cached.info
+}
+
 // Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۳۰ ثانیه
 func startUserInfoCacheGC() {
 	for {
@@ -1107,9 +1118,14 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		extraConfigs = getCachedConfigsForDay(purchaseDay)
 	}
 
-	// 🛡️ [کد جدید]: افزودن هشدار فایروال به کانفیگ‌های اضافه، قبل از بررسی HTML
-	if firewallDecision.AdminWarn && strings.TrimSpace(firewallDecision.WarningConfig) != "" {
-		extraConfigs = append(extraConfigs, strings.TrimSpace(firewallDecision.WarningConfig))
+	var warningCfg string
+	if firewallDecision.AdminWarn {
+		warningCfg = strings.TrimSpace(firewallDecision.WarningConfig)
+	}
+
+	htmlExtraConfigs := extraConfigs
+	if warningCfg != "" {
+		htmlExtraConfigs = append([]string{warningCfg}, extraConfigs...)
 	}
 
 	ct := resp.Header.Get("Content-Type")
@@ -1121,7 +1137,7 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		}
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(resp.StatusCode)
-		w.Write([]byte(injectExtraIntoPasarGuardHTML(string(bodyBytes), extraConfigs)))
+		w.Write([]byte(injectExtraIntoPasarGuardHTML(string(bodyBytes), htmlExtraConfigs)))
 		return
 	}
 
@@ -1133,7 +1149,9 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	}
 
 	configs = append(configs, extraConfigs...)
-
+	if warningCfg != "" {
+		configs = append([]string{warningCfg}, configs...)
+	}
 
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
 
@@ -1309,6 +1327,7 @@ type FirewallSuspiciousRow struct {
 	AdminWarn   bool
 	AdminBurn   bool
 	DeviceCount int
+	Category    string
 }
 
 type FirewallConsoleData struct {
@@ -1360,21 +1379,36 @@ func getSuspiciousFirewallTokens() []FirewallSuspiciousRow {
 	}
 	defer rows.Close()
 
+	isPG := strings.EqualFold(PANEL_TYPE, "pasarguard")
 	var result []FirewallSuspiciousRow
 
 	for rows.Next() {
 		var token string
 		var suspicious, warn, burn, deviceCount int
 
-		if err := rows.Scan(&token, &suspicious, &warn, &burn, &deviceCount); err == nil {
-			result = append(result, FirewallSuspiciousRow{
-				Token:       token,
-				Suspicious:  suspicious != 0,
-				AdminWarn:   warn != 0,
-				AdminBurn:   burn != 0,
-				DeviceCount: deviceCount,
-			})
+		if err := rows.Scan(&token, &suspicious, &warn, &burn, &deviceCount); err != nil {
+			continue
 		}
+
+		category := "-"
+		if isPG {
+			if info := getPasarGuardUserInfoIfCached(token); info != nil {
+				if day := jalaliDayOfPurchase(info.CreatedAt); day > 0 {
+					category = fmt.Sprintf("روز %d", day)
+				}
+			}
+		} else {
+			category = fmt.Sprintf("Inbound %d", getUserInboundID(token))
+		}
+
+		result = append(result, FirewallSuspiciousRow{
+			Token:       token,
+			Suspicious:  suspicious != 0,
+			AdminWarn:   warn != 0,
+			AdminBurn:   burn != 0,
+			DeviceCount: deviceCount,
+			Category:    category,
+		})
 	}
 	return result
 }
@@ -1476,7 +1510,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
             <h4 class="mb-1">🚨 توکن‌های مشکوک</h4>
             <small class="text-muted">مدیریت فوری Warning و Burn بدون Reload صفحه</small>
         </div>
-        <span class="badge bg-warning text-dark">{{len .Firewall.Suspicious}} مورد</span>
+        <span class="badge bg-warning text-dark" id="firewall-count-badge">{{len .Firewall.Suspicious}} مورد</span>
     </div>
     <div id="firewall-alert" class="alert d-none" role="alert"></div>
     <div class="table-responsive">
@@ -1485,6 +1519,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
                 <tr>
                     <th>#</th>
                     <th>Token</th>
+                    <th>دسته/روز</th>
                     <th>دستگاه‌ها</th>
                     <th>وضعیت</th>
                     <th>عملیات</th>
@@ -1495,6 +1530,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
                 <tr id="firewall-row-{{$i}}">
                     <td><strong>{{$i | printf "%d"}}</strong></td>
                     <td><code style="word-break:break-all;">{{$row.Token}}</code></td>
+                    <td><span class="badge bg-light text-dark border">{{$row.Category}}</span></td>
                     <td><span class="badge bg-secondary">{{$row.DeviceCount}}</span></td>
                     <td class="firewall-status-cell">
                         {{if $row.AdminBurn}}
@@ -1507,14 +1543,16 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
                     </td>
                     <td>
                         <div class="btn-group" role="group">
+                            <button type="button" class="btn btn-sm btn-outline-info" onclick="firewallShowHistory('{{js $row.Token}}')">🔍 جزئیات</button>
                             <button type="button" class="btn btn-sm btn-outline-warning" onclick="firewallWarn('{{js $row.Token}}', {{$i}})">⚠️ هشدار</button>
                             <button type="button" class="btn btn-sm btn-outline-danger" onclick="firewallBurn('{{js $row.Token}}', {{$i}})">🔥 قطع کامل</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="firewallReset('{{js $row.Token}}', {{$i}})">♻️ بازنشانی</button>
                         </div>
                     </td>
                 </tr>
             {{else}}
                 <tr>
-                    <td colspan="5" class="text-center text-muted py-4">✅ فعلاً توکن مشکوکی ثبت نشده است.</td>
+                    <td colspan="6" class="text-center text-muted py-4">✅ فعلاً توکن مشکوکی ثبت نشده است.</td>
                 </tr>
             {{end}}
             </tbody>
@@ -1677,6 +1715,21 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 </form>
 </div></div></div>
 
+<div class="modal fade" id="deviceHistoryModal" tabindex="-1">
+<div class="modal-dialog modal-lg"><div class="modal-content">
+<div class="modal-header"><h5 class="modal-title">🔍 جزئیات اتصالات توکن</h5>
+<button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+<div class="modal-body">
+<table class="table table-sm table-striped mb-0">
+<thead><tr><th>IP</th><th>سیستم‌عامل</th><th>اولین اتصال</th></tr></thead>
+<tbody id="deviceHistoryBody"></tbody>
+</table>
+</div>
+<div class="modal-footer">
+<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">بستن</button>
+</div>
+</div></div></div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 $(document).ready(function() {
@@ -1712,6 +1765,21 @@ function showFirewallAlert(message, success) {
     }, 3500);
 }
 
+function updateFirewallCount(delta) {
+    const badge = document.getElementById('firewall-count-badge');
+    if (!badge) return;
+    const match = badge.textContent.match(/\d+/);
+    const current = match ? parseInt(match[0], 10) : 0;
+    badge.textContent = Math.max(0, current + delta) + ' مورد';
+}
+
+function escapeHtml(str) {
+    if (str === undefined || str === null) return '';
+    return String(str).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
 async function firewallPost(url, token, rowIndex, mode) {
     const formData = new URLSearchParams();
     formData.set('token', token);
@@ -1727,18 +1795,32 @@ async function firewallPost(url, token, rowIndex, mode) {
         try { data = JSON.parse(text); } catch (_) {}
         if (!data || !data.ok) throw new Error('عملیات توسط سرور تأیید نشد.');
 
+        if (mode === 'reset') {
+            const row = document.getElementById('firewall-row-' + rowIndex);
+            if (row) row.remove();
+            updateFirewallCount(-1);
+            showFirewallAlert('اتصالات این توکن بازنشانی و از لیست مشکوک حذف شد.', true);
+            return;
+        }
+
         const row = document.getElementById('firewall-row-' + rowIndex);
         if (row) {
             const statusCell = row.querySelector('.firewall-status-cell');
             if (statusCell) {
                 if (mode === 'burn') {
                     statusCell.innerHTML = '<span class="badge bg-danger">🔥 Burn</span>';
-                } else {
-                    statusCell.innerHTML = '<span class="badge bg-warning text-dark">⚠️ Warning</span>';
+                } else if (mode === 'warn') {
+                    statusCell.innerHTML = data.state
+                        ? '<span class="badge bg-warning text-dark">⚠️ Warning</span>'
+                        : '<span class="badge bg-warning text-dark">🚨 مشکوک</span>';
                 }
             }
         }
-        showFirewallAlert(mode === 'burn' ? 'اتصالات این توکن کاملاً قطع شد.' : 'حالت هشدار برای این توکن فعال شد.', true);
+
+        const msg = mode === 'burn'
+            ? 'اتصالات این توکن کاملاً قطع شد.'
+            : (data.state ? 'حالت هشدار برای این توکن فعال شد.' : 'حالت هشدار برای این توکن غیرفعال شد.');
+        showFirewallAlert(msg, true);
     } catch (error) {
         console.error('[Firewall]', error);
         showFirewallAlert('اجرای عملیات ناموفق بود.', false);
@@ -1746,13 +1828,39 @@ async function firewallPost(url, token, rowIndex, mode) {
 }
 
 function firewallWarn(token, rowIndex) {
-    if (!confirm('حالت هشدار برای این توکن فعال شود؟')) return;
+    if (!confirm('وضعیت هشدار برای این توکن تغییر کند؟')) return;
     firewallPost('/aggr-console/firewall/warn', token, rowIndex, 'warn');
 }
 
 function firewallBurn(token, rowIndex) {
     if (!confirm('آیا از قطع کامل اتصالات این توکن مطمئن هستید؟')) return;
     firewallPost('/aggr-console/firewall/burn', token, rowIndex, 'burn');
+}
+
+function firewallReset(token, rowIndex) {
+    if (!confirm('اتصالات و وضعیت این توکن کاملاً بازنشانی شود؟ این عمل توکن را از لیست مشکوک حذف می‌کند.')) return;
+    firewallPost('/aggr-console/firewall/reset', token, rowIndex, 'reset');
+}
+
+async function firewallShowHistory(token) {
+    const modalBody = document.getElementById('deviceHistoryBody');
+    modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">در حال بارگذاری...</td></tr>';
+    var myModal = new bootstrap.Modal(document.getElementById('deviceHistoryModal'));
+    myModal.show();
+    try {
+        const response = await fetch('/aggr-console/firewall/history?token=' + encodeURIComponent(token));
+        if (!response.ok) throw new Error('failed');
+        const devices = await response.json();
+        if (!devices || devices.length === 0) {
+            modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">دستگاهی ثبت نشده است.</td></tr>';
+            return;
+        }
+        modalBody.innerHTML = devices.map(function (d) {
+            return '<tr><td>' + escapeHtml(d.IP) + '</td><td>' + escapeHtml(d.OS) + '</td><td>' + escapeHtml(d.FirstSeen) + '</td></tr>';
+        }).join('');
+    } catch (e) {
+        modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-danger">خطا در بارگذاری اطلاعات.</td></tr>';
+    }
 }
 </script>
 </body>
@@ -1969,12 +2077,38 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "token is required", http.StatusBadRequest)
 			return
 		}
-		if err := setFirewallWarning(token, true); err != nil {
-			http.Error(w, "خطا در فعال‌سازی حالت هشدار", http.StatusInternalServerError)
+		newState, err := toggleFirewallWarning(token)
+		if err != nil {
+			http.Error(w, "خطا در تغییر حالت هشدار", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte(`{"ok":true,"mode":"warn"}`))
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"mode":"warn","state":%v}`, newState)))
+
+	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/reset":
+		token := strings.TrimSpace(r.FormValue("token"))
+		if token == "" {
+			http.Error(w, "token is required", http.StatusBadRequest)
+			return
+		}
+		if err := resetFirewallToken(token); err != nil {
+			http.Error(w, "خطا در بازنشانی اتصالات", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true,"mode":"reset"}`))
+
+	case r.Method == "GET" && r.URL.Path == "/aggr-console/firewall/history":
+		token := strings.TrimSpace(r.URL.Query().Get("token"))
+		if token == "" {
+			http.Error(w, "token is required", http.StatusBadRequest)
+			return
+		}
+		devices := getFirewallTokenDevices(token)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if err := json.NewEncoder(w).Encode(devices); err != nil {
+			log.Printf("[FirewallConsole] history encode failed: %v", err)
+		}
 
 	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/burn":
 		token := strings.TrimSpace(r.FormValue("token"))
@@ -2228,9 +2362,15 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	userInboundID := getUserInboundID(subID)
 	extraConfigs := getCachedConfigsForInbound(userInboundID)
 
-	// 🛡️ [کد جدید]: افزودن هشدار فایروال قبل از خروجی HTML
-	if firewallDecision.AdminWarn && strings.TrimSpace(firewallDecision.WarningConfig) != "" {
-		extraConfigs = append(extraConfigs, strings.TrimSpace(firewallDecision.WarningConfig))
+	var warningCfg string
+	if firewallDecision.AdminWarn {
+		warningCfg = strings.TrimSpace(firewallDecision.WarningConfig)
+	}
+
+	// 🛡️ برای نمای HTML، هشدار اولین آیتم بلوک تزریق‌شونده است
+	htmlExtraConfigs := extraConfigs
+	if warningCfg != "" {
+		htmlExtraConfigs = append([]string{warningCfg}, extraConfigs...)
 	}
 
 	ct := resp.Header.Get("Content-Type")
@@ -2242,7 +2382,7 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		}
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(resp.StatusCode)
-		w.Write([]byte(injectExtraIntoSanaeiHTML(string(bodyBytes), extraConfigs)))
+		w.Write([]byte(injectExtraIntoSanaeiHTML(string(bodyBytes), htmlExtraConfigs)))
 		return
 	}
 
@@ -2253,8 +2393,9 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		configs = strings.Split(payloadText, "\n")
 	}
 	configs = append(configs, extraConfigs...)
-
-	
+	if warningCfg != "" {
+		configs = append([]string{warningCfg}, configs...)
+	}
 
 	finalPayload := normalizeSubscriptionText(strings.Join(configs, "\n"))
 
