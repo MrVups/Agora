@@ -55,6 +55,21 @@ var (
 	PASARGUARD_ADMIN_USER = os.Getenv("PASARGUARD_ADMIN_USER")
 	PASARGUARD_ADMIN_PASS = os.Getenv("PASARGUARD_ADMIN_PASS")
 
+	// 📌 پیکربندی Rate Limiter سراسری برای تماس‌های upstream به PasarGuard
+	// (طبق همان الگوی envOrDefault موجود در پروژه)
+	PASARGUARD_UPSTREAM_RATE_PER_SEC = envOrDefault("PASARGUARD_UPSTREAM_RATE_PER_SEC", "20")
+	PASARGUARD_UPSTREAM_BURST        = envOrDefault("PASARGUARD_UPSTREAM_BURST", "40")
+
+	// 📌 Rate Limiter و Semaphore مجزا برای مسیر داغ /sub (تا با
+	// /info مصرف توکن مشترک را دوبرابر نکند؛ هر درخواست واقعی کاربر
+	// می‌تواند هم /sub و هم /info را صدا بزند).
+	PASARGUARD_SUB_RATE_PER_SEC   = envOrDefault("PASARGUARD_SUB_RATE_PER_SEC", "50")
+	PASARGUARD_SUB_BURST          = envOrDefault("PASARGUARD_SUB_BURST", "100")
+	PASARGUARD_SUB_MAX_CONCURRENT = envOrDefault("PASARGUARD_SUB_MAX_CONCURRENT", "100")
+
+	// 📌 سقف اتصالات هم‌زمان SQLite (جلوگیری از باز شدن کانکشن نامحدود زیر بار)
+	SUB_AGG_DB_MAX_OPEN_CONNS = envOrDefault("SUB_AGG_DB_MAX_OPEN_CONNS", "8")
+
 	BOT_INBOUND_FORMAT = envOrDefault("BOT_INBOUND_FORMAT", "plain")
 )
 
@@ -106,6 +121,16 @@ func initDB() {
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
+	// 📌 سقف اتصالات هم‌زمان — بدون این، زیر بار سنگین database/sql می‌تواند
+	// کانکشن‌های نامحدودی به یک فایل SQLite باز کند. WAL چند Reader هم‌زمان
+	// را اجازه می‌دهد، پس عدد خیلی کوچک بی‌مورد است؛ ولی باید محدود باشد.
+	maxConns := parseInt(SUB_AGG_DB_MAX_OPEN_CONNS, 8)
+	if maxConns <= 0 {
+		maxConns = 8
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+
 	// ============================================================
 	// SQLite Performance / Concurrency PRAGMA
 	// ============================================================
@@ -151,7 +176,7 @@ func initDB() {
 			inbound_id TEXT,
 			raw_config TEXT
 		);`,
-		
+
 		// ---- جداول اختصاصی سیستم فایروال ----
 		`CREATE TABLE IF NOT EXISTS firewall_settings (
 			key TEXT PRIMARY KEY,
@@ -163,6 +188,7 @@ func initDB() {
 			('max_devices_per_token', '5'),
 			('reset_window_hours', '24'),
 			('gc_interval_hours', '6'),
+			('inactive_retention_days', '30'),
 			('warning_fake_config', ''),
 			('block_fake_config', '');`,
 		`CREATE TABLE IF NOT EXISTS ip_tracking_logs (
@@ -203,6 +229,8 @@ func initDB() {
 	}
 
 	migrateMainLinksPoolingSchema()
+	migrateTokenStatusSchema()
+	migrateIPTrackingLogsSchema()
 	seedOrMigrateAdminPassword()
 }
 
@@ -221,7 +249,7 @@ func migrateMainLinksPoolingSchema() {
 			name     string
 			colType  string
 			notNull  int
-			defaultV interface{}
+			defaultV sql.NullString
 			primary  int
 		)
 		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primary); err != nil {
@@ -258,6 +286,108 @@ func migrateMainLinksPoolingSchema() {
 		}
 		log.Printf("[DBMigration] ستون %s با موفقیت اضافه شد.", m.name)
 	}
+}
+
+func migrateTokenStatusSchema() {
+	rows, err := db.Query("PRAGMA table_info(token_status)")
+	if err != nil {
+		log.Printf("[DBMigration] خواندن schema جدول token_status ناموفق بود: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			colType  string
+			notNull  int
+			defaultV sql.NullString
+			primary  int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primary); err != nil {
+			log.Printf("[DBMigration] خواندن ستون token_status ناموفق بود: %v", err)
+			return
+		}
+		existing[name] = true
+	}
+
+	migrations := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "username",
+			stmt: "ALTER TABLE token_status ADD COLUMN username TEXT DEFAULT ''",
+		},
+		{
+			name: "last_active",
+			stmt: "ALTER TABLE token_status ADD COLUMN last_active INTEGER DEFAULT 0",
+		},
+	}
+
+	for _, m := range migrations {
+		if existing[m.name] {
+			continue
+		}
+		if _, err := db.Exec(m.stmt); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+				continue
+			}
+			log.Printf("[DBMigration] افزودن ستون %s به token_status ناموفق بود: %v", m.name, err)
+			continue
+		}
+		log.Printf("[DBMigration] ستون %s با موفقیت به token_status اضافه شد.", m.name)
+	}
+}
+
+func migrateIPTrackingLogsSchema() {
+	rows, err := db.Query("PRAGMA table_info(ip_tracking_logs)")
+	if err != nil {
+		log.Printf("[DBMigration] خواندن schema جدول ip_tracking_logs ناموفق بود: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			colType  string
+			notNull  int
+			defaultV sql.NullString
+			primary  int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primary); err != nil {
+			log.Printf("[DBMigration] خواندن ستون ip_tracking_logs ناموفق بود: %v", err)
+			return
+		}
+		existing[name] = true
+	}
+
+	if existing["client_app"] {
+		// 📌 ستون از قبل موجود است (نصب قبلی که این migration را قبلاً
+		// با موفقیت اجرا کرده) — پرچم را true می‌کنیم.
+		clientAppColumnAvailable.Store(true)
+		return
+	}
+
+	if _, err := db.Exec("ALTER TABLE ip_tracking_logs ADD COLUMN client_app TEXT DEFAULT ''"); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			clientAppColumnAvailable.Store(true)
+			return
+		}
+		// 📌 مهم: اگر ALTER ناموفق بود (و علتش duplicate column نبود)،
+		// پرچم روی false می‌ماند — هیچ کوئری‌ای که به client_app ارجاع
+		// می‌دهد اجرا نخواهد شد. منطق اصلی فایروال کاملاً دست‌نخورده و
+		// فعال باقی می‌ماند؛ فقط قابلیت تله‌متری client_app غیرفعال است.
+		log.Printf("[DBMigration] افزودن ستون client_app به ip_tracking_logs ناموفق بود: %v", err)
+		return
+	}
+	log.Printf("[DBMigration] ستون client_app با موفقیت به ip_tracking_logs اضافه شد.")
+	clientAppColumnAvailable.Store(true)
 }
 
 func seedOrMigrateAdminPassword() {
@@ -510,15 +640,20 @@ func getMD5Hash(text string) string {
 }
 
 // 📌 Data Ingestion Layer: This acts as a dumb worker. It fetches everything every X minutes without executing rotation math.
-func fetchAndCache() {
-	dbLock.Lock()
-	defer dbLock.Unlock()
+var fetchAndCacheRunning atomic.Bool
 
-	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all') FROM main_links WHERE COALESCE(is_active, 1) = 1")
-	if err != nil {
-		log.Printf("[CronFetch] DB Error: %v", err)
+func fetchAndCache() {
+	// 📌 محافظت در برابر اجرای هم‌زمان: fetchAndCache هم توسط تیکر
+	// پس‌زمینه و هم دستی (بعد از هر add/edit/toggle/delete در پنل ادمین)
+	// صدا زده می‌شود. اگر یک اجرا هنوز در حال واکشی HTTP از upstreamهاست،
+	// اجرای جدید به‌جای overlap کردن (که می‌تواند نتیجه‌ی تازه‌تر را با
+	// نتیجه‌ی قدیمی‌تر بازنویسی کند) به‌سادگی نادیده گرفته می‌شود؛ ادیت‌های
+	// جدید ادمین طبیعتاً در دور بعدی (تیکر یا فراخوانی دستی بعدی) اعمال می‌شوند.
+	if !fetchAndCacheRunning.CompareAndSwap(false, true) {
+		log.Printf("[CronFetch] یک اجرای قبلی هنوز در حال انجام است؛ این فراخوانی نادیده گرفته شد.")
 		return
 	}
+	defer fetchAndCacheRunning.Store(false)
 
 	type FetchItem struct {
 		ID            int
@@ -527,6 +662,14 @@ func fetchAndCache() {
 		TargetInbound string
 	}
 
+	// ---- فاز ۱: خواندن لیست لینک‌ها — قفل فقط برای همین خواندن کوتاه ----
+	dbLock.Lock()
+	rows, err := db.Query("SELECT id, title, url, COALESCE(target_inbounds, 'all') FROM main_links WHERE COALESCE(is_active, 1) = 1")
+	if err != nil {
+		dbLock.Unlock()
+		log.Printf("[CronFetch] DB Error: %v", err)
+		return
+	}
 	var linksToFetch []FetchItem
 	for rows.Next() {
 		var item FetchItem
@@ -535,9 +678,11 @@ func fetchAndCache() {
 		}
 	}
 	rows.Close()
+	dbLock.Unlock()
 
+	// ---- فاز ۲: واکشی HTTP از تمام لینک‌ها — کاملاً بدون قفل ----
 	client := &http.Client{Timeout: 15 * time.Second}
-	
+
 	type ConfigItem struct {
 		LinkID    int
 		InboundID string
@@ -553,7 +698,7 @@ func fetchAndCache() {
 			log.Printf("[CronFetch] URL نامعتبر برای '%s': %v", l.Title, reqErr)
 			continue
 		}
-		
+
 		// 🛡️ VPN CLIENT SPOOFING: جعل کردن درخواست به عنوان کلاینت V2rayNG برای استخراج کانفیگ خام از پنل‌های هوشمند
 		req.Header.Set("User-Agent", "v2rayNG/1.8.12")
 		// با عدم ارسال Accept هدرهای اضافی، دقیقاً مشابه رفتار کلاینت واقعی عمل می‌کنیم
@@ -600,14 +745,22 @@ func fetchAndCache() {
 		return
 	}
 
-	if _, err := db.Exec("DELETE FROM cached_configs"); err != nil {
-		log.Printf("[CronFetch] خطا در پاکسازی کش قبلی: %v", err)
-		return
-	}
+	// ---- فاز ۳: نوشتن اتمیک در DB — قفل فقط برای همین فاز ----
+	dbLock.Lock()
+	defer dbLock.Unlock()
 
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("[CronFetch] DB Tx Error: %v", err)
+		return
+	}
+
+	// 📌 DELETE اکنون داخل همان تراکنش INSERTهاست: یا هر دو با هم commit
+	// می‌شوند یا هیچ‌کدام — دیگر پنجره‌ای برای «کش خالی بین DELETE و
+	// commit» در صورت کرش پروسه وجود ندارد.
+	if _, err := tx.Exec("DELETE FROM cached_configs"); err != nil {
+		tx.Rollback()
+		log.Printf("[CronFetch] خطا در پاکسازی کش قبلی: %v", err)
 		return
 	}
 
@@ -722,6 +875,18 @@ func getUserInboundID(subID string) int {
 	return inboundID
 }
 
+// 📌 خواندن مستقیم و لوکال ایمیل/نام‌کاربری از x-ui.db (بدون هیچ تماس شبکه‌ای)
+func getXUIUsername(subID string) string {
+	if xuiDB == nil {
+		return "-"
+	}
+	var email string
+	if err := xuiDB.QueryRow("SELECT email FROM clients WHERE sub_id = ?", subID).Scan(&email); err != nil || email == "" {
+		return "-"
+	}
+	return email
+}
+
 // 📌 Data Serving Layer: Evaluates dynamic load balancing on-the-fly when the user requests their configs
 func getActiveLinkIDsForTargets(targets []string) []int {
 	if len(targets) == 0 {
@@ -774,14 +939,14 @@ func getActiveLinkIDsForTargets(targets []string) []int {
 		sort.SliceStable(poolLinks, func(i, j int) bool {
 			return poolLinks[i].ID < poolLinks[j].ID
 		})
-		
+
 		maxRot := 1
 		for _, l := range poolLinks {
 			if l.RotationMins > maxRot {
 				maxRot = l.RotationMins
 			}
 		}
-		
+
 		windowIndex := (currentUnixMinute / int64(maxRot)) % int64(len(poolLinks))
 		selected := poolLinks[int(windowIndex)]
 		activeIDs = append(activeIDs, selected.ID)
@@ -802,14 +967,14 @@ func getCachedConfigsForActiveLinks(activeIDs []int) []string {
 		args[i] = id
 	}
 	query := "SELECT raw_config FROM cached_configs WHERE link_id IN (" + strings.Join(placeholders, ",") + ")"
-	
+
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("[DataServing] DB Query Error: %v", err)
 		return nil
 	}
 	defer rows.Close()
-	
+
 	var out []string
 	for rows.Next() {
 		var cfg string
@@ -865,12 +1030,21 @@ type pasarGuardUserInfo struct {
 	GroupIDs  []int  `json:"group_ids"`
 	CreatedAt string `json:"created_at"`
 	Status    string `json:"status"`
+	Username  string `json:"username"`
 }
 
-// 📌 پچ جدید: پیاده‌سازی Smart TTL Cache برای مدیریت بهینه حافظه
+// 📌 کش TTL برای اطلاعات کاربر PasarGuard. از نسخه‌ی قبلی حفظ شده،
+// فقط یک فیلد state و persistedValue برای پشتیبانی از مدل چهار-حالته
+// (VALID/NO_USERNAME/INVALID_TOKEN/TRANSIENT) اضافه شده — بدون تغییر رفتار
+// مسیر اصلی سرو ساب‌اسکریپشن (handleSubPasarGuard).
 type cachedUserInfo struct {
-	info      *pasarGuardUserInfo
-	expiresAt time.Time
+	info  *pasarGuardUserInfo
+	state pgUserState
+	// persistedValue آخرین مقداری است که با موفقیت در DB نوشته شده (یا "" اگر
+	// هنوز هیچ‌وقت نوشته نشده)؛ برای جلوگیری از نوشتن تکراری DB به‌ازای
+	// نتیجه‌ی یکسان در هر بار تازه‌سازی کش استفاده می‌شود.
+	persistedValue string
+	expiresAt      time.Time
 }
 
 var (
@@ -878,29 +1052,12 @@ var (
 	pgUserInfoCacheLock sync.RWMutex
 )
 
-// تابع واکشی اطلاعات با بررسی کش
+// تابع واکشی اطلاعات با بررسی کش — امضای بیرونی حفظ شده تا مسیر
+// handleSubPasarGuard بدون تغییر باقی بماند. اکنون داخلاً از
+// resolvePasarGuardUser (چهار-حالته، پشت Circuit Breaker/Rate Limiter/
+// Single-Flight) استفاده می‌کند.
 func getPasarGuardUserInfoCached(token string) *pasarGuardUserInfo {
-	// بررسی موجود بودن در رم (سرعت نور)
-	pgUserInfoCacheLock.RLock()
-	cached, exists := pgUserInfoCache[token]
-	pgUserInfoCacheLock.RUnlock()
-
-	if exists && time.Now().Before(cached.expiresAt) {
-		return cached.info
-	}
-
-	// در صورتی که در رم نبود یا منقضی شده بود، از پاسارگارد واکشی کن
-	info := fetchPasarGuardUserInfo(token)
-
-	// ذخیره در رم با ۳۰ ثانیه اعتبار برای واکنش سریع به وضعیت فعال/غیرفعال کاربر
-	pgUserInfoCacheLock.Lock()
-	pgUserInfoCache[token] = cachedUserInfo{
-		info:      info,
-		expiresAt: time.Now().Add(30 * time.Second), 
-	}
-	pgUserInfoCacheLock.Unlock()
-
-	return info
+	return resolvePasarGuardUser(token).Info
 }
 
 // 📌 خواندن read-only از کش، بدون هیچ فراخوانی شبکه‌ای (برای مسیرهای رندر مثل پنل ادمین)
@@ -917,7 +1074,7 @@ func getPasarGuardUserInfoIfCached(token string) *pasarGuardUserInfo {
 // Garbage Collector: پاکسازی رم از دیتاهای قدیمی هر ۳۰ ثانیه
 func startUserInfoCacheGC() {
 	for {
-		time.Sleep(30 * time.Second) 
+		time.Sleep(30 * time.Second)
 		now := time.Now()
 
 		pgUserInfoCacheLock.Lock()
@@ -930,24 +1087,36 @@ func startUserInfoCacheGC() {
 	}
 }
 
+// fetchPasarGuardUserInfo امضای قبلی را حفظ می‌کند (سازگاری با فراخوانی‌های
+// موجود)؛ اکنون فقط یک wrapper نازک روی نسخه‌ی طبقه‌بندی‌شده است.
 func fetchPasarGuardUserInfo(token string) *pasarGuardUserInfo {
+	_, info := fetchPasarGuardUserInfoClassified(token)
+	return info
+}
+
+// fetchPasarGuardUserInfoClassified تنها جایی است که واقعاً به شبکه تماس
+// می‌گیرد. نتیجه را از طریق classifyPasarGuardOutcome (تعریف‌شده در
+// firewall.go) به یکی از چهار حالت صریح تبدیل می‌کند — این تنها محل
+// تفسیر خطا/وضعیت HTTP در کل پروژه است.
+func fetchPasarGuardUserInfoClassified(token string) (pgUserState, *pasarGuardUserInfo) {
 	url := fmt.Sprintf("%s://127.0.0.1:%s%s%s/info", PASARGUARD_SCHEME, PASARGUARD_PORT, PASARGUARD_SUB_PATH, token)
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Printf("[PasarGuard] خطا در گرفتن اطلاعات کاربر: %v", err)
-		return nil
+		return classifyPasarGuardOutcome(0, err, nil)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil
-	}
+
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return classifyPasarGuardOutcome(resp.StatusCode, nil, nil)
+	}
 	var info pasarGuardUserInfo
 	if err := json.Unmarshal(body, &info); err != nil {
-		return nil
+		// JSON بدشکل با وجود 200 → یک شکست مبهم upstream است، نه توکن نامعتبر.
+		return classifyPasarGuardOutcome(resp.StatusCode, nil, nil)
 	}
-	return &info
+	return classifyPasarGuardOutcome(resp.StatusCode, nil, &info)
 }
 
 func gregorianToJalali(gy, gm, gd int) (int, int, int) {
@@ -1056,7 +1225,15 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 
 	upstreamURL := fmt.Sprintf("%s://127.0.0.1:%s%s%s", PASARGUARD_SCHEME, PASARGUARD_PORT, PASARGUARD_SUB_PATH, token)
 	client := &http.Client{Timeout: 8 * time.Second}
-	req, _ := http.NewRequest("GET", upstreamURL, nil)
+	// 📌 خطای NewRequest دیگر نادیده گرفته نمی‌شود: این یک باگ مستقل بود
+	// (nil-pointer panic روی حلقه‌ی کپی هدر در ادامه) — کاملاً مجزا از
+	// موضوع Circuit Breaker، چون این خط قبل از هر تعاملی با breaker اجرا می‌شود.
+	req, err := http.NewRequest("GET", upstreamURL, nil)
+	if err != nil {
+		log.Printf("[PasarGuard] ساخت درخواست upstream ناموفق بود: %v", err)
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
 
 	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
 
@@ -1079,11 +1256,54 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.1")
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
+	// ============================================================
+	// 🛡️ محافظت مسیر داغ /sub: Circuit Breaker مشترک با /info + Rate
+	// Limiter مجزا + Semaphore هم‌زمانی. هر سه رد شدن دقیقاً همان پاسخ
+	// موجود «Subscription upstream error» را برمی‌گردانند — یعنی رفتار
+	// قابل‌مشاهده برای کلاینت نهایی نسبت به قبل تغییری نکرده، فقط سریع‌تر
+	// fail می‌شویم وقتی از قبل می‌دانیم upstream ناسالم/پرفشار است.
+	// ============================================================
+	if !pgCircuitBreaker.Allow() {
 		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
 		return
 	}
+	// 📌 Exception-Safe Ownership Cleanup: از همین‌جا به بعد، اگر تابع از
+	// هر مسیری (return عادی یا یک panic پیش‌بینی‌نشده در آینده) خارج شود
+	// بدون این‌که RecordResult واقعی صدا زده باشد، این defer به‌طور خودکار
+	// "حق تماس" گرفته‌شده از Allow() را آزاد می‌کند — جلوی قفل‌شدن ابدی
+	// Half-Open را می‌گیرد، حتی اگر کد آینده یک panic جدید معرفی کند.
+	consumed := false
+	defer func() {
+		if !consumed {
+			pgCircuitBreaker.ReleaseWithoutResult()
+		}
+	}()
+
+	if !pgSubRateLimiter.Allow() {
+		// رد شدن محلی است، نه شکست upstream؛ defer بالا "حق تماس" را آزاد می‌کند.
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
+	select {
+	case pgSubConcurrency <- struct{}{}:
+		defer func() { <-pgSubConcurrency }()
+	default:
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		pgCircuitBreaker.RecordResult(false)
+		consumed = true
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
+	// 📌 فقط خطای شبکه یا 5xx شکست زیرساختی محسوب می‌شود؛ هر status code
+	// دیگر (شامل 4xx که می‌تواند معنای معتبر کسب‌وکاری داشته باشد) upstream
+	// را سالم می‌داند — رفتار پاس‌شدن پاسخ به کاربر نهایی (چند خط پایین‌تر) دست‌نخورده می‌ماند.
+	pgCircuitBreaker.RecordResult(!isPgUpstreamInfraFailure(nil, resp.StatusCode))
+	consumed = true
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
@@ -1187,37 +1407,66 @@ func getPasarGuardAdminToken(forceRefresh bool) string {
 	if PASARGUARD_ADMIN_USER == "" || PASARGUARD_ADMIN_PASS == "" {
 		return ""
 	}
+
 	pgTokenLock.Lock()
-	defer pgTokenLock.Unlock()
-
 	if !forceRefresh && pgTokenCache != "" && time.Now().Before(pgTokenExpires) {
-		return pgTokenCache
+		cached := pgTokenCache
+		pgTokenLock.Unlock()
+		return cached
 	}
+	pgTokenLock.Unlock()
 
-	form := url.Values{}
-	form.Set("username", PASARGUARD_ADMIN_USER)
-	form.Set("password", PASARGUARD_ADMIN_PASS)
+	// 📌 به‌جای نگه‌داشتن pgTokenLock در طول کل تماس شبکه‌ای (که چند
+	// درخواست هم‌زمان را بی‌دلیل تا ۵ ثانیه سریالایز می‌کرد)، از
+	// Single-Flight موجود استفاده می‌کنیم: حداکثر یک تماس واقعی upstream
+	// هم‌زمان برای گرفتن توکن ادمین در جریان است.
+	v, err := pgAdminTokenSF.Do("pg-admin-token", func() (interface{}, error) {
+		// Double-checked locking: شاید leader قبلی همین الان توکن را تازه کرده باشد.
+		pgTokenLock.Lock()
+		if pgTokenCache != "" && time.Now().Before(pgTokenExpires) {
+			cached := pgTokenCache
+			pgTokenLock.Unlock()
+			return cached, nil
+		}
+		pgTokenLock.Unlock()
 
-	loginURL := fmt.Sprintf("%s://127.0.0.1:%s/api/admin/token", PASARGUARD_SCHEME, PASARGUARD_PORT)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.PostForm(loginURL, form)
+		form := url.Values{}
+		form.Set("username", PASARGUARD_ADMIN_USER)
+		form.Set("password", PASARGUARD_ADMIN_PASS)
+
+		loginURL := fmt.Sprintf("%s://127.0.0.1:%s/api/admin/token", PASARGUARD_SCHEME, PASARGUARD_PORT)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.PostForm(loginURL, form)
+		if err != nil {
+			return "", nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return "", nil
+		}
+		body, _ := io.ReadAll(resp.Body)
+		var tok struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.Unmarshal(body, &tok); err != nil || tok.AccessToken == "" {
+			return "", nil
+		}
+
+		pgTokenLock.Lock()
+		pgTokenCache = tok.AccessToken
+		pgTokenExpires = time.Now().Add(20 * time.Hour)
+		pgTokenLock.Unlock()
+
+		return tok.AccessToken, nil
+	})
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	token, ok := v.(string)
+	if !ok {
 		return ""
 	}
-	body, _ := io.ReadAll(resp.Body)
-	var tok struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(body, &tok); err != nil || tok.AccessToken == "" {
-		return ""
-	}
-	pgTokenCache = tok.AccessToken
-	pgTokenExpires = time.Now().Add(20 * time.Hour)
-	return pgTokenCache
+	return token
 }
 
 func getPasarGuardGroups() []pgGroupSimple {
@@ -1327,12 +1576,20 @@ type FirewallSuspiciousRow struct {
 	AdminWarn   bool
 	AdminBurn   bool
 	DeviceCount int
-	Category    string
+	Username    string
 }
 
 type FirewallConsoleData struct {
-	Settings   FirewallSettings
-	Suspicious []FirewallSuspiciousRow
+	Settings     FirewallSettings
+	Suspicious   []FirewallSuspiciousRow
+	CurrentPage  int
+	TotalPages   int
+	TotalRecords int
+	SearchQuery  string
+	HasPrevPage  bool
+	HasNextPage  bool
+	PrevPage     int
+	NextPage     int
 }
 
 type ConsoleData struct {
@@ -1355,10 +1612,110 @@ func boolToInt(v bool) int {
 	return 0
 }
 
-func getSuspiciousFirewallTokens() []FirewallSuspiciousRow {
-	if db == nil {
-		return nil
+const firewallDashboardPageSize = 50
+const firewallSearchMaxLen = 200
+const firewallCountCacheTTL = 5 * time.Second
+const firewallCountCacheLimit = 200
+const firewallMaxPage = 100000
+
+// 📌 کش کوتاه‌مدت COUNT(*) — چون این کوئری با هر جست‌وجوی متفاوت هزینه‌ی
+// جداگانه دارد، و زیر یک burst بازدید پنل ادمین می‌تواند تکراری/پرهزینه شود.
+type firewallCountCacheItem struct {
+	Count  int
+	Expire time.Time
+}
+
+var firewallCountCacheMu sync.RWMutex
+var firewallCountCache = make(map[string]firewallCountCacheItem)
+
+func getSuspiciousCount(searchPattern string) int {
+	now := time.Now()
+	firewallCountCacheMu.RLock()
+	item, ok := firewallCountCache[searchPattern]
+	firewallCountCacheMu.RUnlock()
+	if ok && now.Before(item.Expire) {
+		return item.Count
 	}
+
+	// 📌 Single-Flight: اگر ۵۰ ادمین هم‌زمان دقیقاً همین جست‌وجو را وقتی
+	// کش تازه منقضی شده انجام دهند، فقط یک COUNT(*) واقعی روی SQLite
+	// اجرا می‌شود، نه ۵۰ کوئری هم‌زمان.
+	v, err := firewallCountSF.Do(searchPattern, func() (interface{}, error) {
+		refreshNow := time.Now()
+
+		// Double-checked locking: شاید leader قبلی همین الان کش را پر کرده باشد.
+		firewallCountCacheMu.RLock()
+		if item, ok := firewallCountCache[searchPattern]; ok && refreshNow.Before(item.Expire) {
+			firewallCountCacheMu.RUnlock()
+			return item.Count, nil
+		}
+		firewallCountCacheMu.RUnlock()
+
+		var count int
+		if db != nil {
+			_ = db.QueryRow(`
+				SELECT COUNT(*) FROM token_status
+				WHERE is_suspicious = 1 AND (token LIKE ? OR COALESCE(username,'') LIKE ?)
+			`, searchPattern, searchPattern).Scan(&count)
+		}
+
+		firewallCountCacheMu.Lock()
+		if len(firewallCountCache) >= firewallCountCacheLimit {
+			sampledEvict(firewallCountCache, func(v firewallCountCacheItem) time.Time { return v.Expire })
+		}
+		firewallCountCache[searchPattern] = firewallCountCacheItem{Count: count, Expire: refreshNow.Add(firewallCountCacheTTL)}
+		firewallCountCacheMu.Unlock()
+
+		return count, nil
+	})
+	if err != nil {
+		return 0
+	}
+	count, ok2 := v.(int)
+	if !ok2 {
+		return 0
+	}
+	return count
+}
+
+// getSuspiciousFirewallTokens صفحه‌بندی‌شده و قابل‌جست‌وجو است: حداکثر
+// firewallDashboardPageSize ردیف در هر بار، هرگز کل جدول را یک‌جا در
+// حافظه نمی‌خواند. ورودی‌ها (طول جست‌وجو، شماره صفحه) قبل از ساخت کوئری
+// نرمال‌سازی/محدود می‌شوند تا از مقادیر پاتولوژیک جلوگیری شود.
+func getSuspiciousFirewallTokens(searchQuery string, page int) FirewallConsoleData {
+	result := FirewallConsoleData{CurrentPage: 1, TotalPages: 1}
+
+	searchQuery = strings.TrimSpace(searchQuery)
+	if len(searchQuery) > firewallSearchMaxLen {
+		searchQuery = searchQuery[:firewallSearchMaxLen]
+	}
+	result.SearchQuery = searchQuery
+
+	if page < 1 {
+		page = 1
+	}
+	if page > firewallMaxPage {
+		page = firewallMaxPage
+	}
+
+	if db == nil {
+		return result
+	}
+
+	pattern := "%" + searchQuery + "%"
+	totalRecords := getSuspiciousCount(pattern)
+	result.TotalRecords = totalRecords
+
+	totalPages := 1
+	if totalRecords > 0 {
+		totalPages = (totalRecords + firewallDashboardPageSize - 1) / firewallDashboardPageSize
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	result.CurrentPage = page
+	result.TotalPages = totalPages
+	offset := (page - 1) * firewallDashboardPageSize
 
 	rows, err := db.Query(`
 		SELECT 
@@ -1366,49 +1723,71 @@ func getSuspiciousFirewallTokens() []FirewallSuspiciousRow {
 			t.is_suspicious, 
 			t.admin_warn_mode, 
 			t.admin_burn_mode, 
-			COUNT(l.id)
+			COUNT(l.id),
+			COALESCE(t.username, '')
 		FROM token_status t
 		LEFT JOIN ip_tracking_logs l ON t.token = l.token
-		WHERE t.is_suspicious = 1
+		WHERE t.is_suspicious = 1 AND (t.token LIKE ? OR COALESCE(t.username,'') LIKE ?)
 		GROUP BY t.token
 		ORDER BY t.token ASC
-	`)
+		LIMIT ? OFFSET ?
+	`, pattern, pattern, firewallDashboardPageSize, offset)
 	if err != nil {
 		log.Printf("[FirewallConsole] suspicious query failed: %v", err)
-		return nil
+		return result
 	}
 	defer rows.Close()
 
 	isPG := strings.EqualFold(PANEL_TYPE, "pasarguard")
-	var result []FirewallSuspiciousRow
+	var suspicious []FirewallSuspiciousRow
 
 	for rows.Next() {
-		var token string
-		var suspicious, warn, burn, deviceCount int
+		var token, savedUsername string
+		var isSuspiciousFlag, warn, burn, deviceCount int
 
-		if err := rows.Scan(&token, &suspicious, &warn, &burn, &deviceCount); err != nil {
+		if err := rows.Scan(&token, &isSuspiciousFlag, &warn, &burn, &deviceCount, &savedUsername); err != nil {
 			continue
 		}
 
-		category := "-"
+		username := "-"
 		if isPG {
-			if info := getPasarGuardUserInfoIfCached(token); info != nil {
-				if day := jalaliDayOfPurchase(info.CreatedAt); day > 0 {
-					category = fmt.Sprintf("روز %d", day)
-				}
+			// 📌 Persistent Memoization: هرگز در مسیر رندر تماس شبکه‌ای زده نمی‌شود.
+			// مقدار ذخیره‌شده در DB می‌تواند یک نام‌کاربری واقعی، یکی از دو
+			// سنتینل حالت قطعی (بدون نام / نامعتبر)، یا خالی (هنوز lookup نشده) باشد.
+			savedUsername = strings.TrimSpace(savedUsername)
+			switch savedUsername {
+			case "":
+				username = "LAZY_LOAD"
+			case pgSentinelNoUsername:
+				username = "بدون نام‌کاربری"
+			case pgSentinelInvalid:
+				username = "❌ نامعتبر"
+			default:
+				username = savedUsername
 			}
 		} else {
-			category = fmt.Sprintf("Inbound %d", getUserInboundID(token))
+			// x-ui: کوئری local روی xuiDB، بدون هیچ فراخوانی شبکه‌ای
+			username = getXUIUsername(token)
 		}
 
-		result = append(result, FirewallSuspiciousRow{
+		suspicious = append(suspicious, FirewallSuspiciousRow{
 			Token:       token,
-			Suspicious:  suspicious != 0,
+			Suspicious:  isSuspiciousFlag != 0,
 			AdminWarn:   warn != 0,
 			AdminBurn:   burn != 0,
 			DeviceCount: deviceCount,
-			Category:    category,
+			Username:    username,
 		})
+	}
+
+	result.Suspicious = suspicious
+	result.HasPrevPage = page > 1
+	result.HasNextPage = page < totalPages
+	if result.HasPrevPage {
+		result.PrevPage = page - 1
+	}
+	if result.HasNextPage {
+		result.NextPage = page + 1
 	}
 	return result
 }
@@ -1486,7 +1865,11 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
             <label class="form-label">فاصله GC (ساعت)</label>
             <input type="number" name="gc_interval_hours" class="form-control" min="1" value="{{.Firewall.Settings.GCIntervalHours}}" required>
         </div>
-        <div class="col-md-9"></div>
+        <div class="col-md-3">
+            <label class="form-label">مدت زمان نگهداری توکن‌های غیرفعال (روز)</label>
+            <input type="number" name="inactive_retention_days" class="form-control" min="1" value="{{.Firewall.Settings.InactiveRetentionDays}}" required>
+        </div>
+        <div class="col-md-6"></div>
         <div class="col-md-6">
             <label class="form-label">⚠️ کانفیگ هشدار مشکوک</label>
             <textarea name="warning_fake_config" class="form-control" rows="4" placeholder="کانفیگ نمایشی هشدار...">{{.Firewall.Settings.WarningFakeConfig}}</textarea>
@@ -1510,8 +1893,21 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
             <h4 class="mb-1">🚨 توکن‌های مشکوک</h4>
             <small class="text-muted">مدیریت فوری Warning و Burn بدون Reload صفحه</small>
         </div>
-        <span class="badge bg-warning text-dark" id="firewall-count-badge">{{len .Firewall.Suspicious}} مورد</span>
+        <span class="badge bg-warning text-dark" id="firewall-count-badge">{{.Firewall.TotalRecords}} مورد</span>
     </div>
+    <form method="get" action="/aggr-console#firewall" class="row g-2 mb-3">
+        <div class="col-md-6">
+            <input type="text" name="search" class="form-control" placeholder="جستجو بر اساس Token یا نام‌کاربری..." value="{{.Firewall.SearchQuery}}" maxlength="200">
+        </div>
+        <div class="col-md-2">
+            <button type="submit" class="btn btn-outline-primary w-100">🔍 جستجو</button>
+        </div>
+        {{if .Firewall.SearchQuery}}
+        <div class="col-md-2">
+            <a href="/aggr-console#firewall" class="btn btn-outline-secondary w-100">پاک کردن</a>
+        </div>
+        {{end}}
+    </form>
     <div id="firewall-alert" class="alert d-none" role="alert"></div>
     <div class="table-responsive">
         <table class="table table-hover align-middle mb-0">
@@ -1519,7 +1915,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
                 <tr>
                     <th>#</th>
                     <th>Token</th>
-                    <th>دسته/روز</th>
+                    <th>نام کاربری</th>
                     <th>دستگاه‌ها</th>
                     <th>وضعیت</th>
                     <th>عملیات</th>
@@ -1530,7 +1926,13 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
                 <tr id="firewall-row-{{$i}}">
                     <td><strong>{{$i | printf "%d"}}</strong></td>
                     <td><code style="word-break:break-all;">{{$row.Token}}</code></td>
-                    <td><span class="badge bg-light text-dark border">{{$row.Category}}</span></td>
+                    <td>
+                        {{if eq $row.Username "LAZY_LOAD"}}
+                            <span class="lazy-fetch text-muted" data-token="{{$row.Token}}">در حال واکشی...</span>
+                        {{else}}
+                            <span class="badge bg-light text-dark border">{{$row.Username}}</span>
+                        {{end}}
+                    </td>
                     <td><span class="badge bg-secondary">{{$row.DeviceCount}}</span></td>
                     <td class="firewall-status-cell">
                         {{if $row.AdminBurn}}
@@ -1558,6 +1960,23 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
             </tbody>
         </table>
     </div>
+    {{if gt .Firewall.TotalPages 1}}
+    <nav class="mt-3">
+        <ul class="pagination pagination-sm justify-content-center mb-0">
+            {{if .Firewall.HasPrevPage}}
+                <li class="page-item"><a class="page-link" href="/aggr-console?page={{.Firewall.PrevPage}}&search={{.Firewall.SearchQuery}}#firewall">قبلی</a></li>
+            {{else}}
+                <li class="page-item disabled"><span class="page-link">قبلی</span></li>
+            {{end}}
+            <li class="page-item disabled"><span class="page-link">صفحه {{.Firewall.CurrentPage}} از {{.Firewall.TotalPages}}</span></li>
+            {{if .Firewall.HasNextPage}}
+                <li class="page-item"><a class="page-link" href="/aggr-console?page={{.Firewall.NextPage}}&search={{.Firewall.SearchQuery}}#firewall">بعدی</a></li>
+            {{else}}
+                <li class="page-item disabled"><span class="page-link">بعدی</span></li>
+            {{end}}
+        </ul>
+    </nav>
+    {{end}}
 </div>
 
 {{if not .IsPasarGuard}}
@@ -1721,7 +2140,7 @@ body { background-color: #f8f9fa; font-family: Tahoma, sans-serif; }
 <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
 <div class="modal-body">
 <table class="table table-sm table-striped mb-0">
-<thead><tr><th>IP</th><th>سیستم‌عامل</th><th>اولین اتصال</th></tr></thead>
+<thead><tr><th>IP</th><th>سیستم‌عامل</th><th>کلاینت</th><th>اولین اتصال</th></tr></thead>
 <tbody id="deviceHistoryBody"></tbody>
 </table>
 </div>
@@ -1844,7 +2263,7 @@ function firewallReset(token, rowIndex) {
 
 async function firewallShowHistory(token) {
     const modalBody = document.getElementById('deviceHistoryBody');
-    modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">در حال بارگذاری...</td></tr>';
+    modalBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">در حال بارگذاری...</td></tr>';
     var myModal = new bootstrap.Modal(document.getElementById('deviceHistoryModal'));
     myModal.show();
     try {
@@ -1852,23 +2271,76 @@ async function firewallShowHistory(token) {
         if (!response.ok) throw new Error('failed');
         const devices = await response.json();
         if (!devices || devices.length === 0) {
-            modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">دستگاهی ثبت نشده است.</td></tr>';
+            modalBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">دستگاهی ثبت نشده است.</td></tr>';
             return;
         }
         modalBody.innerHTML = devices.map(function (d) {
-            return '<tr><td>' + escapeHtml(d.IP) + '</td><td>' + escapeHtml(d.OS) + '</td><td>' + escapeHtml(d.FirstSeen) + '</td></tr>';
+            return '<tr><td>' + escapeHtml(d.IP) + '</td><td>' + escapeHtml(d.OS) + '</td><td>' + escapeHtml(d.ClientApp) + '</td><td>' + escapeHtml(d.FirstSeen) + '</td></tr>';
         }).join('');
     } catch (e) {
-        modalBody.innerHTML = '<tr><td colspan="3" class="text-center text-danger">خطا در بارگذاری اطلاعات.</td></tr>';
+        modalBody.innerHTML = '<tr><td colspan="4" class="text-center text-danger">خطا در بارگذاری اطلاعات.</td></tr>';
     }
 }
+
+// 📌 Lazy-Load نام‌کاربری پاسارگارد: صفحه فوراً رندر می‌شود، سپس همه‌ی
+// ردیف‌های نیازمند lookup واکشی می‌شوند. نرخ واقعی تماس با PasarGuard
+// توسط Rate Limiter/Circuit Breaker سمت سرور کنترل می‌شود، نه با تاخیر
+// جاوااسکریپتی. صفحه‌بندی سمت سرور از قبل تعداد ردیف‌های هر صفحه را به
+// حداکثر ۵۰ محدود کرده، اما برای اطمینان مضاعف (extreme safety)، در
+// صورت وجود بیش از حد مجاز batch سمت سرور، اینجا هم به تکه‌های ۵۰تایی
+// تقسیم و به‌صورت متوالی (نه موازی) پردازش می‌شود.
+(async function () {
+    var elements = Array.prototype.slice.call(document.querySelectorAll('.lazy-fetch'));
+    if (elements.length === 0) return;
+
+    var BATCH_MAX = 50;
+
+    function applyResult(el, item) {
+        if (!item) {
+            el.textContent = '-';
+            el.classList.remove('lazy-fetch');
+            return;
+        }
+        if (item.state === 'VALID' && item.username) {
+            el.outerHTML = '<span class="badge bg-light text-dark border">' + escapeHtml(item.username) + '</span>';
+        } else if (item.state === 'NO_USERNAME') {
+            el.outerHTML = '<span class="badge bg-light text-dark border">بدون نام‌کاربری</span>';
+        } else if (item.state === 'INVALID_TOKEN') {
+            el.outerHTML = '<span class="badge bg-danger">❌ نامعتبر</span>';
+        } else {
+            // TRANSIENT: شکست موقت upstream/rate-limit؛ با رفرش بعدی صفحه دوباره تلاش می‌شود.
+            el.textContent = '-';
+            el.classList.remove('lazy-fetch');
+        }
+    }
+
+    for (var start = 0; start < elements.length; start += BATCH_MAX) {
+        var chunk = elements.slice(start, start + BATCH_MAX);
+        var tokens = chunk.map(function (el) { return el.getAttribute('data-token') || ''; });
+        try {
+            var res = await fetch('/aggr-console/firewall/userinfo-batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tokens: tokens })
+            });
+            var data = res.ok ? await res.json() : null;
+            var results = (data && data.results) || [];
+            chunk.forEach(function (el, i) { applyResult(el, results[i]); });
+        } catch (e) {
+            chunk.forEach(function (el) {
+                el.textContent = '-';
+                el.classList.remove('lazy-fetch');
+            });
+        }
+    }
+})();
 </script>
 </body>
 </html>`
 
 var tmpl = template.Must(template.New("console").Parse(consoleTmpl))
 
-func renderConsole(w http.ResponseWriter, username string) {
+func renderConsole(w http.ResponseWriter, r *http.Request, username string) {
 	rows, _ := db.Query("SELECT id, title, url, COALESCE(target_inbounds,'all'), COALESCE(pool_name,''), COALESCE(rotation_hours,0), COALESCE(is_active,1), COALESCE(last_updated,'-') FROM main_links ORDER BY id DESC")
 	byGroup := map[string][]LinkRow{}
 	if rows != nil {
@@ -1936,10 +2408,12 @@ func renderConsole(w http.ResponseWriter, username string) {
 	}
 
 	// 🛡️ ایجاد داده‌های مربوط به فایروال برای تزریق به پنل HTML
-	firewallData := FirewallConsoleData{
-		Settings:   getFirewallSettings(),
-		Suspicious: getSuspiciousFirewallTokens(),
-	}
+	// (پارامترهای page/search نرمال‌سازی/محدودسازی‌شان داخل خودِ
+	// getSuspiciousFirewallTokens انجام می‌شود)
+	searchQuery := r.URL.Query().Get("search")
+	page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	firewallData := getSuspiciousFirewallTokens(searchQuery, page)
+	firewallData.Settings = getFirewallSettings()
 
 	data := ConsoleData{
 		Username:     username,
@@ -2017,6 +2491,7 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		maxDevices := parseInt(r.FormValue("max_devices_per_token"), 5)
 		resetWindowHours := parseInt(r.FormValue("reset_window_hours"), 24)
 		gcIntervalHours := parseInt(r.FormValue("gc_interval_hours"), 6)
+		inactiveRetentionDays := parseInt(r.FormValue("inactive_retention_days"), 30)
 
 		if maxDevices <= suspicionThreshold {
 			http.Error(w, "سقف دستگاه باید بیشتر از آستانه مشکوک بودن باشد", http.StatusBadRequest)
@@ -2027,13 +2502,14 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		blockConfig := strings.TrimSpace(r.FormValue("block_fake_config"))
 
 		settings := map[string]string{
-			"firewall_enabled":      strconv.Itoa(boolToInt(enabled)),
-			"suspicion_threshold":   strconv.Itoa(suspicionThreshold),
-			"max_devices_per_token": strconv.Itoa(maxDevices),
-			"reset_window_hours":    strconv.Itoa(resetWindowHours),
-			"gc_interval_hours":     strconv.Itoa(gcIntervalHours),
-			"warning_fake_config":   warningConfig,
-			"block_fake_config":     blockConfig,
+			"firewall_enabled":        strconv.Itoa(boolToInt(enabled)),
+			"suspicion_threshold":     strconv.Itoa(suspicionThreshold),
+			"max_devices_per_token":   strconv.Itoa(maxDevices),
+			"reset_window_hours":      strconv.Itoa(resetWindowHours),
+			"gc_interval_hours":       strconv.Itoa(gcIntervalHours),
+			"inactive_retention_days": strconv.Itoa(inactiveRetentionDays),
+			"warning_fake_config":     warningConfig,
+			"block_fake_config":       blockConfig,
 		}
 
 		tx, err := db.Begin()
@@ -2109,6 +2585,69 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(devices); err != nil {
 			log.Printf("[FirewallConsole] history encode failed: %v", err)
 		}
+
+	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/userinfo-batch":
+		const maxBatchTokens = 50
+		const maxTokenLen = 256
+
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+		var req struct {
+			Tokens []string `json:"tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if len(req.Tokens) == 0 {
+			http.Error(w, "tokens is required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Tokens) > maxBatchTokens {
+			http.Error(w, "too many tokens in one batch", http.StatusBadRequest)
+			return
+		}
+
+		type userinfoResult struct {
+			State    string `json:"state"`
+			Username string `json:"username,omitempty"`
+		}
+		results := make([]userinfoResult, len(req.Tokens))
+
+		var wg sync.WaitGroup
+		for i, rawToken := range req.Tokens {
+			token := strings.TrimSpace(rawToken)
+			if token == "" || len(token) > maxTokenLen {
+				// ورودی نامعتبر یک آیتم، کل batch را fail نمی‌کند.
+				results[i] = userinfoResult{State: string(pgUserStateTransient)}
+				continue
+			}
+			wg.Add(1)
+			go func(idx int, tok string) {
+				defer wg.Done()
+				// 📌 دفاع لایه‌دوم: حتی بعد از اصلاح sfGroup برای عدم
+				// دوباره-panic زدن، این گوروتین خام مستقل یک recover
+				// مخصوص خودش هم دارد تا هر مسیر آینده‌ای که ممکن است
+				// بدون عبور از sfGroup اینجا اضافه شود هم ایمن بماند.
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[FirewallConsole] recovered panic in userinfo-batch worker: %v", r)
+						results[idx] = userinfoResult{State: string(pgUserStateTransient)}
+					}
+				}()
+				// 📌 resolvePasarGuardUser خودش Single-Flight/Circuit-Breaker/
+				// Rate-Limiter را اعمال می‌کند؛ توکن‌های تکراری در همین batch
+				// (یا حتی در batchهای هم‌زمان دیگر ادمین‌ها) به‌طور خودکار
+				// در همان‌جا collapse می‌شوند، نیازی به دی‌دوپ محلی نیست.
+				res := resolvePasarGuardUser(tok)
+				results[idx] = userinfoResult{State: string(res.State), Username: res.Username}
+			}(i, token)
+		}
+		wg.Wait()
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(struct {
+			Results []userinfoResult `json:"results"`
+		}{Results: results})
 
 	case r.Method == "POST" && r.URL.Path == "/aggr-console/firewall/burn":
 		token := strings.TrimSpace(r.FormValue("token"))
@@ -2246,7 +2785,7 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/aggr-console", http.StatusSeeOther)
 
 	default:
-		renderConsole(w, username)
+		renderConsole(w, r, username)
 	}
 }
 
@@ -2455,7 +2994,14 @@ func cliResetAdminPassword() {
 		fmt.Println("Failed to create DB directory:", err)
 		os.Exit(1)
 	}
-	localDB, err := sql.Open("sqlite3", DB_PATH+"?_journal_mode=WAL")
+	localDB, err := sql.Open(
+		"sqlite3",
+		DB_PATH+
+			"?_journal_mode=WAL"+
+			"&_synchronous=NORMAL"+
+			"&_busy_timeout=5000"+
+			"&_temp_store=MEMORY",
+	)
 	if err != nil {
 		fmt.Println("Failed to open database:", err)
 		os.Exit(1)
