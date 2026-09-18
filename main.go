@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/mattn/go-sqlite3"
@@ -2338,6 +2339,30 @@ async function firewallShowHistory(token) {
 </body>
 </html>`
 
+// normalizeInboundKey cleans a target_inbounds value before numeric comparison.
+// Values typed/pasted on Persian keyboards or copied from RTL sources (Telegram,
+// Word, etc.) often carry invisible bidi/format characters (RLM/LRM/ALM/BOM) or
+// use Persian/Arabic-Indic digits instead of ASCII digits. strconv.Atoi fails
+// silently on both, which is what was causing the sort to fall back to
+// lexicographic string comparison even though every value "looked" numeric.
+func normalizeInboundKey(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case unicode.Is(unicode.Cf, r): // bidi/format marks: RLM, LRM, ALM, BOM, etc.
+			continue
+		case r >= '۰' && r <= '۹': // Persian (Extended Arabic-Indic) digits U+06F0-06F9
+			b.WriteRune('0' + (r - '۰'))
+		case r >= '٠' && r <= '٩': // Arabic-Indic digits U+0660-0669
+			b.WriteRune('0' + (r - '٠'))
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 var tmpl = template.Must(template.New("console").Parse(consoleTmpl))
 
 func renderConsole(w http.ResponseWriter, r *http.Request, username string) {
@@ -2361,15 +2386,16 @@ func renderConsole(w http.ResponseWriter, r *http.Request, username string) {
 	}
 	sort.SliceStable(groupKeys, func(i, j int) bool {
 		ki, kj := groupKeys[i], groupKeys[j]
-		if ki == "all" {
+		if strings.EqualFold(strings.TrimSpace(ki), "all") {
 			return true
 		}
-		if kj == "all" {
+		if strings.EqualFold(strings.TrimSpace(kj), "all") {
 			return false
 		}
 		// تلاش برای تبدیل به عدد و مرتب‌سازی ریاضی
-		numI, errI := strconv.Atoi(ki)
-		numJ, errJ := strconv.Atoi(kj)
+		// (پاک‌سازی کاراکترهای نامرئی/جهت‌ساز و ارقام فارسی/عربی قبل از تبدیل)
+		numI, errI := strconv.Atoi(normalizeInboundKey(ki))
+		numJ, errJ := strconv.Atoi(normalizeInboundKey(kj))
 		if errI == nil && errJ == nil {
 			return numI < numJ
 		}
@@ -2677,6 +2703,9 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSpace(r.FormValue("title"))
 		urls := r.FormValue("urls")
 		inbounds := strings.TrimSpace(r.FormValue("target_inbounds"))
+		if !strings.EqualFold(inbounds, "all") {
+			inbounds = normalizeInboundKey(inbounds)
+		}
 		poolName := strings.TrimSpace(r.FormValue("pool_name"))
 		rotationHours := 0
 		if raw := strings.TrimSpace(r.FormValue("rotation_hours")); raw != "" {
@@ -2713,6 +2742,9 @@ func handleConsole(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSpace(r.FormValue("title"))
 		urlVal := strings.TrimSpace(r.FormValue("url"))
 		inbounds := strings.TrimSpace(r.FormValue("target_inbounds"))
+		if !strings.EqualFold(inbounds, "all") {
+			inbounds = normalizeInboundKey(inbounds)
+		}
 		poolName := strings.TrimSpace(r.FormValue("pool_name"))
 		rotationHours := 0
 		if raw := strings.TrimSpace(r.FormValue("rotation_hours")); raw != "" {
