@@ -2359,14 +2359,22 @@ func renderConsole(w http.ResponseWriter, r *http.Request, username string) {
 	for k := range byGroup {
 		groupKeys = append(groupKeys, k)
 	}
-	sort.Slice(groupKeys, func(i, j int) bool {
-		if groupKeys[i] == "all" {
+	sort.SliceStable(groupKeys, func(i, j int) bool {
+		ki, kj := groupKeys[i], groupKeys[j]
+		if ki == "all" {
 			return true
 		}
-		if groupKeys[j] == "all" {
+		if kj == "all" {
 			return false
 		}
-		return groupKeys[i] < groupKeys[j]
+		// تلاش برای تبدیل به عدد و مرتب‌سازی ریاضی
+		numI, errI := strconv.Atoi(ki)
+		numJ, errJ := strconv.Atoi(kj)
+		if errI == nil && errJ == nil {
+			return numI < numJ
+		}
+		// اگر عدد نبودند، همان مرتب‌سازی متنی قبلی
+		return ki < kj
 	})
 	unitLabel := "اینباند"
 	if strings.EqualFold(PANEL_TYPE, "pasarguard") {
