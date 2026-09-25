@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/subtle"
 	"crypto/tls"
@@ -13,12 +14,14 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/mattn/go-sqlite3"
@@ -523,6 +527,1384 @@ func looksLikeHTMLResponse(body []byte, contentType string) bool {
 		strings.HasPrefix(trimmed, "<html")
 }
 
+// ============================================================
+// 📦 Sing-box JSON Compatibility Layer
+// پنل‌های PasarGuard/Marzban بر اساس User-Agent واقعی کلاینت (که این
+// aggregator عیناً به upstream پاس می‌دهد) فرمت پاسخ ساب‌اسکریپشن را
+// تغییر می‌دهند: برای sing-box و کلاینت‌های خانواده‌ی SagerNet
+// (SFA/SFI/SFD/SFM)، به‌جای لیست خط‌به‌خط لینک، یک کانفیگ کامل JSON
+// native سینگ‌باکس برمی‌گردانند. این بخش تشخیص می‌دهد پاسخ JSON است یا
+// نه و در صورت نیاز extraConfigs/هشدار ادمین/بلاک فایروال را به‌صورت
+// outbound معتبر سینگ‌باکس داخل همان JSON تزریق می‌کند.
+//
+// کاملاً مستقل از منطق امنیتی/فایروال (firewall.go دست‌نخورده می‌ماند)
+// و مستقل از هر تابع تله‌متری کلاینت (detectClientApp)؛ صرفاً یک لایه‌ی
+// HTTP response-formatting در همین فایل است.
+// ============================================================
+
+func looksLikeJSONResponse(body []byte, contentType string) bool {
+	if strings.Contains(strings.ToLower(contentType), "application/json") {
+		return true
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return false
+	}
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return false
+	}
+	return json.Valid(body)
+}
+
+// decodeBase64Flexible چند حالت رایج base64 (استاندارد/URL-safe،
+// با/بدون padding) را امتحان می‌کند — برای payload های vmess و ss لازم است.
+func decodeBase64Flexible(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	variants := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.RawURLEncoding,
+	}
+	var lastErr error
+	for _, enc := range variants {
+		decoded, err := enc.DecodeString(s)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// toInt مقادیر عددی JSON را که ممکن است float64, string, یا int باشند
+// به int تبدیل می‌کند. توجه: این تابع دیگر برای اعتبارسنجی پورت یا هر
+// فیلد عددی حیاتی استفاده نمی‌شود (به‌جای آن toPortStrictFromJSON و
+// toNonNegativeIntStrict که رد کردن مقادیر نامعتبر را تضمین می‌کنند)،
+// و صرفاً برای سازگاری باقی نگه داشته شده است.
+func toInt(v interface{}) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(t))
+		return n
+	default:
+		return 0
+	}
+}
+
+// toBoolParam یک parser سخت‌گیرانه برای مقادیر بولی query-string است.
+// دقیقاً همین ۶ مقدار (case-sensitive، بدون نرمال‌سازی case) پذیرفته
+// می‌شوند: "1", "true", "yes" → true و "0", "false", "no" → false.
+// هر مقدار دیگری (شامل "TRUE"، "False"، "wat"، "2"، رشته‌ی خالی و...) خطا
+// برمی‌گرداند — دیگر هیچ مقداری silently به false coerce نمی‌شود. فقط
+// فضای خالی ابتدا/انتهای رشته trim می‌شود؛ case دست‌نخورده می‌ماند.
+func toBoolParam(v string) (bool, error) {
+	v = strings.TrimSpace(v)
+	switch v {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value: %q", v)
+	}
+}
+
+// validatePortRange فقط پورت‌های معتبر TCP/UDP (۱ تا ۶۵۵۳۵) را می‌پذیرد.
+func validatePortRange(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port out of range: %d", port)
+	}
+	return nil
+}
+
+// parseStrictPort یک رشته‌ی پورت را دقیقاً به یک عدد صحیح در بازه‌ی
+// معتبر تبدیل می‌کند. هیچ کوارس‌سازی/truncateی مجاز نیست: فقط ارقام
+// ۰-۹ پذیرفته می‌شوند (بدون علامت، بدون فاصله، بدون اعشار).
+func parseStrictPort(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty port")
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("non-numeric port: %q", s)
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if err := validatePortRange(n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// toPortStrictFromJSON یک مقدار JSON (float64 یا string، طبق رفتار
+// encoding/json روی اعداد) را به‌عنوان پورت اعتبارسنجی می‌کند. مقادیر
+// اعشاری غیرصحیح (مثل 443.5) یا خارج از بازه رد می‌شوند، نه truncate.
+func toPortStrictFromJSON(v interface{}) (int, error) {
+	switch t := v.(type) {
+	case float64:
+		if t != math.Trunc(t) {
+			return 0, fmt.Errorf("port is not an integer: %v", t)
+		}
+		n := int(t)
+		if err := validatePortRange(n); err != nil {
+			return 0, err
+		}
+		return n, nil
+	case string:
+		return parseStrictPort(t)
+	default:
+		return 0, fmt.Errorf("invalid port type: %T", v)
+	}
+}
+
+// toNonNegativeIntStrict برای فیلدهای عددی غیر-پورت (مثل vmess aid)
+// استفاده می‌شود: باید عدد صحیح و غیرمنفی باشد.
+func toNonNegativeIntStrict(v interface{}) (int, error) {
+	switch t := v.(type) {
+	case float64:
+		if t != math.Trunc(t) {
+			return 0, fmt.Errorf("not an integer: %v", t)
+		}
+		n := int(t)
+		if n < 0 {
+			return 0, fmt.Errorf("negative value: %d", n)
+		}
+		return n, nil
+	case string:
+		s := strings.TrimSpace(t)
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid non-negative integer: %q", t)
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("invalid type: %T", v)
+	}
+}
+
+func splitHostPortFromURL(u *url.URL) (string, int, error) {
+	host := u.Hostname()
+	if host == "" {
+		return "", 0, fmt.Errorf("empty host")
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		return "", 0, fmt.Errorf("empty port")
+	}
+	port, err := parseStrictPort(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, port, nil
+}
+
+// hostPortWithDefault مشابه splitHostPortFromURL است، با این تفاوت که
+// اگر پورت در URI ذکر نشده باشد، از defaultPort استفاده می‌کند (برای
+// hysteria2 که طبق پروتکل پورت پیش‌فرض ۴۴۳ دارد). اگر پورت ذکر شده
+// باشد، همچنان دقیقاً و سخت‌گیرانه اعتبارسنجی می‌شود.
+func hostPortWithDefault(u *url.URL, defaultPort int) (string, int, error) {
+	host := u.Hostname()
+	if host == "" {
+		return "", 0, fmt.Errorf("empty host")
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		if err := validatePortRange(defaultPort); err != nil {
+			return "", 0, fmt.Errorf("empty port and no valid default")
+		}
+		return host, defaultPort, nil
+	}
+	port, err := parseStrictPort(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, port, nil
+}
+
+// buildTransportObject بر اساس پارامتر type (ws/grpc/http/h2) شیء
+// transport مشترک بین vless/vmess/trojan را می‌سازد. سخت‌گیرانه است:
+// اگر type صریحاً چیزی غیر از موارد پشتیبانی‌شده (یا خالی/tcp/raw که
+// معادل عدم وجود transport است) باشد، خطا برمی‌گرداند — هرگز به‌صورت
+// خاموش نادیده گرفته نمی‌شود.
+func buildTransportObject(q url.Values) (map[string]interface{}, error) {
+	netType := strings.ToLower(strings.TrimSpace(q.Get("type")))
+	switch netType {
+	case "":
+		return nil, nil
+	case "tcp", "raw":
+		// معادل صریح عدم وجود transport (پیش‌فرض سینگ‌باکس)؛ خطا نیست.
+		return nil, nil
+	case "ws":
+		t := map[string]interface{}{"type": "ws"}
+		if path := q.Get("path"); path != "" {
+			t["path"] = path
+		}
+		if host := q.Get("host"); host != "" {
+			t["headers"] = map[string]interface{}{"Host": host}
+		}
+		return t, nil
+	case "grpc":
+		t := map[string]interface{}{"type": "grpc"}
+		if sn := q.Get("serviceName"); sn != "" {
+			t["service_name"] = sn
+		}
+		return t, nil
+	case "http", "h2":
+		t := map[string]interface{}{"type": "http"}
+		if path := q.Get("path"); path != "" {
+			t["path"] = path
+		}
+		if host := q.Get("host"); host != "" {
+			t["host"] = []string{host}
+		}
+		return t, nil
+	default:
+		return nil, fmt.Errorf("unsupported transport type: %q", netType)
+	}
+}
+
+// uuidPattern فرمت canonical استاندارد UUID را اعتبارسنجی می‌کند
+// (8-4-4-4-12 hexadecimal، بدون محدودیت روی version/variant bits) —
+// طبق درخواست صریح، هر UUID معتبر پذیرفته می‌شود، نه فقط v4.
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func isValidUUID(s string) bool {
+	return uuidPattern.MatchString(strings.TrimSpace(s))
+}
+
+// isValidRealityShortID طبق schema فعلی سینگ‌باکس، short_id باید یک رشته‌ی
+// hexadecimal با طول زوج و حداکثر ۱۶ کاراکتر باشد (رشته‌ی خالی هم مجاز
+// است و یعنی short_id مشخص نشده). هر مقدار دیگری (طول فرد، کاراکتر
+// غیر-hex، یا طول بیش از ۱۶) رد می‌شود.
+func isValidRealityShortID(s string) bool {
+	if len(s) > 16 || len(s)%2 != 0 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidRealityPublicKey کلید عمومی X25519 مورد استفاده در Reality را
+// اعتبارسنجی می‌کند: باید base64 معتبر (استاندارد یا URL-safe، با یا
+// بدون padding) باشد که دقیقاً به ۳۲ بایت decode شود.
+func isValidRealityPublicKey(s string) bool {
+	decoded, err := decodeBase64Flexible(s)
+	if err != nil {
+		return false
+	}
+	return len(decoded) == 32
+}
+
+// vlessAllowedFlows: مقادیر مجاز فیلد "flow" طبق schema فعلی VLESS در
+// سینگ‌باکس (خانواده‌ی XTLS-Vision). "" یعنی flow صریحاً مشخص نشده.
+// هر مقدار دیگری صراحتاً رد می‌شود، نه silently پذیرفته.
+var vlessAllowedFlows = map[string]bool{
+	"":                 true,
+	"xtls-rprx-vision": true,
+}
+
+func buildVlessOutbound(rawURI, tag string) (map[string]interface{}, error) {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(u.Scheme, "vless") {
+		return nil, fmt.Errorf("not a vless uri")
+	}
+	uuid := u.User.Username()
+	if !isValidUUID(uuid) {
+		return nil, fmt.Errorf("vless: invalid uuid: %q", uuid)
+	}
+	host, port, err := splitHostPortFromURL(u)
+	if err != nil {
+		return nil, fmt.Errorf("vless: %v", err)
+	}
+	// 📌 Query Parsing سخت‌گیرانه: u.Query() خطای percent-encoding نامعتبر
+	// را silently نادیده می‌گیرد. اینجا صراحتاً با ParseQuery چک می‌شود.
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("vless: invalid query parameters: %v", err)
+	}
+
+	out := map[string]interface{}{
+		"type":        "vless",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"uuid":        uuid,
+	}
+	flow := q.Get("flow")
+	if !vlessAllowedFlows[flow] {
+		return nil, fmt.Errorf("vless: unsupported flow: %q", flow)
+	}
+	if flow != "" {
+		out["flow"] = flow
+	}
+
+	security := strings.ToLower(strings.TrimSpace(q.Get("security")))
+	switch security {
+	case "", "none":
+		// بدون tls
+	case "tls", "reality":
+		tlsObj := map[string]interface{}{"enabled": true}
+		if sni := q.Get("sni"); sni != "" {
+			tlsObj["server_name"] = sni
+		}
+		// 📌 پارامتر بولی allowInsecure فقط وقتی صراحتاً در query موجود
+		// باشد بررسی می‌شود (غیاب آن یعنی false ساکت، بدون خطا)؛ اما اگر
+		// موجود باشد و مقدارش با toBoolParam سخت‌گیرانه مطابقت نداشته
+		// باشد (مثلاً "TRUE" یا "wat")، کل تبدیل خطا می‌دهد.
+		if raw, present := q["allowInsecure"]; present {
+			insecureVal, err := toBoolParam(raw[0])
+			if err != nil {
+				return nil, fmt.Errorf("vless: allowInsecure: %v", err)
+			}
+			if insecureVal {
+				tlsObj["insecure"] = true
+			}
+		}
+		if fp := q.Get("fp"); fp != "" {
+			tlsObj["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
+		}
+		if alpnRaw := q.Get("alpn"); alpnRaw != "" {
+			var alpnList []string
+			for _, a := range strings.Split(alpnRaw, ",") {
+				a = strings.TrimSpace(a)
+				if a != "" {
+					alpnList = append(alpnList, a)
+				}
+			}
+			if len(alpnList) > 0 {
+				tlsObj["alpn"] = alpnList
+			}
+		}
+		if security == "reality" {
+			// 📌 Reality بدون pbk (public_key) یا sid (short_id) یک outbound
+			// ساختاراً ناقص و غیرقابل‌اتصال تولید می‌کند — طبق الزام صریح،
+			// این دو فیلد برای reality اجباری‌اند، نه اختیاری.
+			pbk := q.Get("pbk")
+			if pbk == "" {
+				return nil, fmt.Errorf("vless: reality requires non-empty pbk (public_key)")
+			}
+			if !isValidRealityPublicKey(pbk) {
+				return nil, fmt.Errorf("vless: reality: invalid public_key (pbk): %q", pbk)
+			}
+			sid, hasSid := q["sid"]
+			if !hasSid || len(sid) == 0 {
+				return nil, fmt.Errorf("vless: reality requires sid (short_id) parameter")
+			}
+			if !isValidRealityShortID(sid[0]) {
+				return nil, fmt.Errorf("vless: reality: invalid short_id (sid): %q", sid[0])
+			}
+			reality := map[string]interface{}{
+				"enabled":    true,
+				"public_key": pbk,
+				"short_id":   sid[0],
+			}
+			tlsObj["reality"] = reality
+		}
+		out["tls"] = tlsObj
+	default:
+		return nil, fmt.Errorf("vless: unsupported security type: %q", security)
+	}
+
+	transport, err := buildTransportObject(q)
+	if err != nil {
+		return nil, fmt.Errorf("vless: %v", err)
+	}
+	if transport != nil {
+		out["transport"] = transport
+	}
+
+	return out, nil
+}
+
+// vmessSecurityMethods مقادیر مجاز فیلد "scy" در vmess JSON. هر مقدار
+// دیگری صراحتاً خطا برمی‌گرداند (نه silently ignore).
+var vmessSecurityMethods = map[string]bool{
+	"":                       true,
+	"auto":                   true,
+	"aes-128-gcm":            true,
+	"chacha20-poly1305":      true,
+	"chacha20-ietf-poly1305": true,
+	"none":                   true,
+	"zero":                   true,
+}
+
+// vmessStringField یک فیلد اختیاری VMess را می‌خواند: اگر کلید اصلاً وجود
+// نداشته باشد رشته‌ی خالی برمی‌گرداند (بدون خطا)؛ اگر وجود دارد ولی نوعش
+// string نیست، خطا برمی‌گرداند — هرگز silently به مقدار پیش‌فرض تبدیل نمی‌شود.
+func vmessStringField(m map[string]interface{}, key string) (string, error) {
+	raw, exists := m[key]
+	if !exists {
+		return "", nil
+	}
+	s, isStr := raw.(string)
+	if !isStr {
+		return "", fmt.Errorf("field %q has wrong type: %T (expected string)", key, raw)
+	}
+	return s, nil
+}
+
+func buildVmessOutbound(rawURI, tag string) (map[string]interface{}, error) {
+	if !strings.HasPrefix(strings.ToLower(rawURI), "vmess://") {
+		return nil, fmt.Errorf("not a vmess uri")
+	}
+	payload := rawURI[len("vmess://"):]
+	if idx := strings.Index(payload, "#"); idx != -1 {
+		payload = payload[:idx]
+	}
+	decoded, err := decodeBase64Flexible(payload)
+	if err != nil {
+		return nil, fmt.Errorf("vmess: base64 decode failed: %v", err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(decoded, &m); err != nil {
+		return nil, fmt.Errorf("vmess: json decode failed: %v", err)
+	}
+
+	// 📌 هر فیلد رشته‌ای صراحتاً با type assertion چک می‌شود؛ اگر کلید با
+	// نوع اشتباه وجود داشته باشد (مثلاً "scy": 123)، کل تبدیل خطا می‌دهد —
+	// هرگز silently به مقدار پیش‌فرض/خالی reinterpret نمی‌شود.
+	host, err := vmessStringField(m, "add")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: add: %v", err)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil, fmt.Errorf("vmess: empty host")
+	}
+
+	idVal, err := vmessStringField(m, "id")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: id: %v", err)
+	}
+	idVal = strings.TrimSpace(idVal)
+	if !isValidUUID(idVal) {
+		return nil, fmt.Errorf("vmess: invalid uuid/id: %q", idVal)
+	}
+
+	portVal, err := toPortStrictFromJSON(m["port"])
+	if err != nil {
+		return nil, fmt.Errorf("vmess: invalid port: %v", err)
+	}
+
+	security, err := vmessStringField(m, "scy")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: scy: %v", err)
+	}
+	security = strings.ToLower(strings.TrimSpace(security))
+	if !vmessSecurityMethods[security] {
+		return nil, fmt.Errorf("vmess: unsupported security method: %q", security)
+	}
+	if security == "" {
+		security = "auto"
+	}
+
+	out := map[string]interface{}{
+		"type":        "vmess",
+		"tag":         tag,
+		"server":      host,
+		"server_port": portVal,
+		"uuid":        idVal,
+		"security":    security,
+	}
+	if aidRaw, ok := m["aid"]; ok {
+		aidVal, err := toNonNegativeIntStrict(aidRaw)
+		if err != nil {
+			return nil, fmt.Errorf("vmess: invalid aid: %v", err)
+		}
+		out["alter_id"] = aidVal
+	}
+
+	netType, err := vmessStringField(m, "net")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: net: %v", err)
+	}
+	path, err := vmessStringField(m, "path")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: path: %v", err)
+	}
+	hostHeader, err := vmessStringField(m, "host")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: host: %v", err)
+	}
+	q := url.Values{}
+	if netType != "" {
+		q.Set("type", netType)
+	}
+	// 📌 معنای فیلد "path" وابسته به نوع transport است: برای ws/http همان
+	// مسیر HTTP است، ولی برای net=grpc طبق قرارداد رایج vmess JSON (که
+	// generatorهای اشتراک از آن استفاده می‌کنند)، "path" در واقع
+	// serviceName گرفته‌شده‌است، نه یک path واقعی. نگاشت اشتباه به "path"
+	// باعث می‌شد buildTransportObject این مقدار را برای grpc اصلاً
+	// نبیند (چون grpc دنبال کلید serviceName می‌گردد) و serviceName
+	// silently گم شود.
+	if path != "" {
+		if strings.EqualFold(netType, "grpc") {
+			q.Set("serviceName", path)
+		} else {
+			q.Set("path", path)
+		}
+	}
+	if hostHeader != "" {
+		q.Set("host", hostHeader)
+	}
+	transport, err := buildTransportObject(q)
+	if err != nil {
+		return nil, fmt.Errorf("vmess: %v", err)
+	}
+	if transport != nil {
+		out["transport"] = transport
+	}
+
+	tlsVal, err := vmessStringField(m, "tls")
+	if err != nil {
+		return nil, fmt.Errorf("vmess: tls: %v", err)
+	}
+	tlsVal = strings.ToLower(strings.TrimSpace(tlsVal))
+	switch tlsVal {
+	case "", "none":
+		// بدون tls
+	case "tls":
+		sni, err := vmessStringField(m, "sni")
+		if err != nil {
+			return nil, fmt.Errorf("vmess: sni: %v", err)
+		}
+		tlsObj := map[string]interface{}{"enabled": true}
+		if sni != "" {
+			tlsObj["server_name"] = sni
+		}
+		// 📌 fp (uTLS fingerprint) و alpn: فیلدهای رایج در vmess JSON که
+		// generatorهای اشتراک اضافه می‌کنند. طبق الزام صریح، این پارامترها
+		// باید faithfully به schema سینگ‌باکس نگاشت شوند، نه silently drop.
+		fp, err := vmessStringField(m, "fp")
+		if err != nil {
+			return nil, fmt.Errorf("vmess: fp: %v", err)
+		}
+		if fp != "" {
+			tlsObj["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
+		}
+		alpnRaw, err := vmessStringField(m, "alpn")
+		if err != nil {
+			return nil, fmt.Errorf("vmess: alpn: %v", err)
+		}
+		if alpnRaw != "" {
+			var alpnList []string
+			for _, a := range strings.Split(alpnRaw, ",") {
+				a = strings.TrimSpace(a)
+				if a != "" {
+					alpnList = append(alpnList, a)
+				}
+			}
+			if len(alpnList) > 0 {
+				tlsObj["alpn"] = alpnList
+			}
+		}
+		// 📌 insecure: بعضی generatorها این را به‌صورت رشته‌ی بولی ("0"/"1"/
+		// "true"/"false"/...) در vmess JSON قرار می‌دهند. اگر کلید وجود
+		// نداشته باشد صرفاً نادیده گرفته می‌شود؛ اگر وجود داشته باشد باید
+		// دقیقاً با toBoolParam سخت‌گیرانه معتبر باشد وگرنه خطا.
+		insecureRaw, err := vmessStringField(m, "insecure")
+		if err != nil {
+			return nil, fmt.Errorf("vmess: insecure: %v", err)
+		}
+		if insecureRaw != "" {
+			insecureVal, err := toBoolParam(insecureRaw)
+			if err != nil {
+				return nil, fmt.Errorf("vmess: insecure: %v", err)
+			}
+			if insecureVal {
+				tlsObj["insecure"] = true
+			}
+		}
+		out["tls"] = tlsObj
+	default:
+		return nil, fmt.Errorf("vmess: unsupported tls value: %q", tlsVal)
+	}
+
+	return out, nil
+}
+
+func buildTrojanOutbound(rawURI, tag string) (map[string]interface{}, error) {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(u.Scheme, "trojan") {
+		return nil, fmt.Errorf("not a trojan uri")
+	}
+	password := u.User.Username()
+	if password == "" {
+		return nil, fmt.Errorf("trojan: empty password")
+	}
+	host, port, err := splitHostPortFromURL(u)
+	if err != nil {
+		return nil, fmt.Errorf("trojan: %v", err)
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("trojan: invalid query parameters: %v", err)
+	}
+
+	security := strings.ToLower(strings.TrimSpace(q.Get("security")))
+	if security != "" && security != "tls" {
+		return nil, fmt.Errorf("trojan: unsupported security type: %q", security)
+	}
+
+	tlsObj := map[string]interface{}{"enabled": true}
+	if sni := q.Get("sni"); sni != "" {
+		tlsObj["server_name"] = sni
+	}
+	if raw, present := q["allowInsecure"]; present {
+		insecureVal, err := toBoolParam(raw[0])
+		if err != nil {
+			return nil, fmt.Errorf("trojan: allowInsecure: %v", err)
+		}
+		if insecureVal {
+			tlsObj["insecure"] = true
+		}
+	}
+
+	out := map[string]interface{}{
+		"type":        "trojan",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"password":    password,
+		"tls":         tlsObj,
+	}
+	transport, err := buildTransportObject(q)
+	if err != nil {
+		return nil, fmt.Errorf("trojan: %v", err)
+	}
+	if transport != nil {
+		out["transport"] = transport
+	}
+	return out, nil
+}
+
+// buildShadowsocksOutbound هر دو فرمت رایج ss:// را دقیق و بدون
+// اشتباه‌گرفتن با یکدیگر پشتیبانی می‌کند:
+//   - SIP002: ss://BASE64(method:password)@host:port  یا
+//     ss://method:password@host:port (userinfo خام، با percent-encoding
+//     احتمالی روی پسورد)
+//   - Legacy تمام-base64: ss://BASE64(method:password@host:port)
+//
+// تشخیص بین این دو صرفاً بر اساس وجود یک '@' واقعی (literal) در متن خام
+// بعد از ss:// است؛ اگر '@' وجود دارد یعنی فرم مدرن (SIP002)، وگرنه
+// فرم قدیمی. پارامتر plugin پشتیبانی نمی‌شود و باعث خطا (نه drop خاموش)
+// می‌شود تا معنای واقعی نود هرگز به‌اشتباه نمایش داده نشود.
+// ssAllowedMethods: روش‌های رمزنگاری پشتیبانی‌شده توسط shadowsocks outbound
+// سینگ‌باکس (schema فعلی پروژه). هر روش دیگری صراحتاً رد می‌شود.
+var ssAllowedMethods = map[string]bool{
+	"aes-128-gcm":                   true,
+	"aes-192-gcm":                   true,
+	"aes-256-gcm":                   true,
+	"chacha20-ietf-poly1305":        true,
+	"xchacha20-ietf-poly1305":       true,
+	"2022-blake3-aes-128-gcm":       true,
+	"2022-blake3-aes-256-gcm":       true,
+	"2022-blake3-chacha20-poly1305": true,
+	"none":                          true,
+}
+
+func buildShadowsocksOutbound(rawURI, tag string) (map[string]interface{}, error) {
+	if !strings.HasPrefix(strings.ToLower(rawURI), "ss://") {
+		return nil, fmt.Errorf("not a shadowsocks uri")
+	}
+	rest := rawURI[len("ss://"):]
+
+	if idx := strings.Index(rest, "#"); idx != -1 {
+		rest = rest[:idx]
+	}
+
+	var rawQuery string
+	if idx := strings.Index(rest, "?"); idx != -1 {
+		rawQuery = rest[idx+1:]
+		rest = rest[:idx]
+	}
+
+	if rawQuery != "" {
+		q, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return nil, fmt.Errorf("ss: invalid query parameters: %v", err)
+		}
+		if plugin := q.Get("plugin"); plugin != "" {
+			return nil, fmt.Errorf("ss: unsupported plugin parameter: %q", plugin)
+		}
+	}
+
+	var method, password, hostPort string
+
+	// 📌 تشخیص فرمت (SIP002 مدرن در برابر legacy تمام-base64) صرفاً بر
+	// اساس وجود یک '@' literal در رشته‌ی خام (قبل از هر گونه trim) است —
+	// دقیقاً همان‌طور که قبلاً بود. تفاوت کلیدی: دیگر هیچ‌جا قبل از تشخیص
+	// فرمت و decode، بر اساس '/' truncate نمی‌کنیم؛ '/' یک کاراکتر معتبر
+	// Base64 است و می‌تواند داخل payload رمزنگاری‌شده (چه userinfo در فرم
+	// مدرن، چه کل payload در فرم legacy) ظاهر شود.
+	if atIdx := strings.LastIndex(rest, "@"); atIdx != -1 {
+		// فرم مدرن SIP002: userinfo قبل از @، host:port[/path] بعد از آن.
+		// trailing path (اگر باشد) فقط از قسمت بعد از @ حذف می‌شود — نه از
+		// userinfo، چون '/' آنجا می‌تواند بخشی معتبر از base64 باشد.
+		userInfoRaw := rest[:atIdx]
+		afterAt := rest[atIdx+1:]
+		if idx := strings.Index(afterAt, "/"); idx != -1 {
+			afterAt = afterAt[:idx]
+		}
+		hostPort = afterAt
+		if hostPort == "" {
+			return nil, fmt.Errorf("ss: empty host:port")
+		}
+
+		userInfoDecoded, decErr := url.QueryUnescape(userInfoRaw)
+		if decErr != nil {
+			// 📌 خطای percent-encoding نامعتبر در userinfo دیگر silently
+			// نادیده گرفته نمی‌شود (قبلاً fallback به رشته‌ی خام می‌کرد) —
+			// طبق الزام صریح، این یک شکست atomic است.
+			return nil, fmt.Errorf("ss: invalid percent-encoding in userinfo: %v", decErr)
+		}
+
+		if strings.Contains(userInfoDecoded, ":") {
+			// userinfo خام "method:password" (بدون base64)
+			parts := strings.SplitN(userInfoDecoded, ":", 2)
+			method, password = parts[0], parts[1]
+		} else {
+			// userinfo به‌صورت base64(method:password) طبق SIP002
+			decoded, err := decodeBase64Flexible(userInfoRaw)
+			if err != nil {
+				return nil, fmt.Errorf("ss: base64 userinfo decode failed: %v", err)
+			}
+			mp := strings.SplitN(string(decoded), ":", 2)
+			if len(mp) != 2 {
+				return nil, fmt.Errorf("ss: invalid decoded method:password")
+			}
+			method, password = mp[0], mp[1]
+		}
+	} else {
+		// فرم قدیمی: کل payload (شامل هر '/' احتمالی) به‌صورت کامل و
+		// بدون هیچ truncation قبل از decode پردازش می‌شود.
+		decoded, err := decodeBase64Flexible(rest)
+		if err != nil {
+			return nil, fmt.Errorf("ss: legacy base64 decode failed: %v", err)
+		}
+		full := string(decoded)
+		atIdx2 := strings.LastIndex(full, "@")
+		if atIdx2 == -1 {
+			return nil, fmt.Errorf("ss: legacy payload missing '@'")
+		}
+		methodPass := full[:atIdx2]
+		hostPort = full[atIdx2+1:]
+		mp := strings.SplitN(methodPass, ":", 2)
+		if len(mp) != 2 {
+			return nil, fmt.Errorf("ss: invalid legacy method:password")
+		}
+		method, password = mp[0], mp[1]
+	}
+
+	if method == "" || password == "" {
+		return nil, fmt.Errorf("ss: empty method or password")
+	}
+	if !ssAllowedMethods[strings.ToLower(method)] {
+		return nil, fmt.Errorf("ss: unsupported method: %q", method)
+	}
+
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return nil, fmt.Errorf("ss: invalid host:port: %v", err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("ss: empty host")
+	}
+	port, err := parseStrictPort(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("ss: %v", err)
+	}
+
+	return map[string]interface{}{
+		"type":        "shadowsocks",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"method":      strings.ToLower(method),
+		"password":    password,
+	}, nil
+}
+
+// buildHysteria2Outbound کل بخش auth قبل از @ را (نه فقط username) به‌عنوان
+// password در نظر می‌گیرد — اگر userinfo شامل ":" باشد (مثلاً user:pass)،
+// هر دو بخش با ":" دوباره ترکیب می‌شوند تا هیچ بخشی از اطلاعات احراز هویت
+// گم نشود. اگر پورت در URI ذکر نشده باشد، از پورت پیش‌فرض پروتکل (۴۴۳)
+// استفاده می‌شود؛ اگر ذکر شده باشد، باز هم سخت‌گیرانه اعتبارسنجی می‌شود.
+func buildHysteria2Outbound(rawURI, tag string) (map[string]interface{}, error) {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(u.Scheme, "hysteria2") && !strings.EqualFold(u.Scheme, "hy2") {
+		return nil, fmt.Errorf("not a hysteria2 uri")
+	}
+	if u.User == nil {
+		return nil, fmt.Errorf("hysteria2: missing auth")
+	}
+	auth := u.User.Username()
+	if pass, hasPass := u.User.Password(); hasPass {
+		auth = auth + ":" + pass
+	}
+	if auth == "" {
+		return nil, fmt.Errorf("hysteria2: empty auth")
+	}
+
+	host, port, err := hostPortWithDefault(u, 443)
+	if err != nil {
+		return nil, fmt.Errorf("hysteria2: %v", err)
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("hysteria2: invalid query parameters: %v", err)
+	}
+
+	tlsObj := map[string]interface{}{"enabled": true}
+	if sni := q.Get("sni"); sni != "" {
+		tlsObj["server_name"] = sni
+	}
+	if insecureRaw := q.Get("insecure"); insecureRaw != "" {
+		insecureVal, err := toBoolParam(insecureRaw)
+		if err != nil {
+			return nil, fmt.Errorf("hysteria2: insecure: %v", err)
+		}
+		tlsObj["insecure"] = insecureVal
+	}
+	if alpnRaw := q.Get("alpn"); alpnRaw != "" {
+		var alpnList []string
+		for _, a := range strings.Split(alpnRaw, ",") {
+			a = strings.TrimSpace(a)
+			if a != "" {
+				alpnList = append(alpnList, a)
+			}
+		}
+		if len(alpnList) > 0 {
+			tlsObj["alpn"] = alpnList
+		}
+	}
+	// 📌 pinSHA256 (پین کردن گواهی سرور بر اساس هش SHA256): schema فعلی
+	// سینگ‌باکس (option/tls.go) هیچ فیلد معادلی برای این نوع pinning در
+	// tls خروجی ندارد (فقط server_name/insecure/alpn/certificate/ech/
+	// reality/utls پشتیبانی می‌شوند). طبق الزام صریح «map کامل یا خطا»،
+	// چون معادل صادقانه‌ای وجود ندارد، این پارامتر با خطا رد می‌شود —
+	// silently نادیده گرفته نمی‌شود.
+	if pinRaw := q.Get("pinSHA256"); pinRaw != "" {
+		return nil, fmt.Errorf("hysteria2: pinSHA256 is not representable in the target sing-box schema")
+	}
+	// 📌 ech: طبق قرارداد رایج لینک‌های hysteria2 (v2rayN/NekoBox و مشابه)،
+	// مقدار پارامتر ech حاوی ECHConfigList به‌صورت base64 است. این مستقیماً
+	// به فیلد رسمی سینگ‌باکس tls.ech.config نگاشت می‌شود
+	// (option/tls.go: OutboundECHOptions.Config). اگر decode base64 آن
+	// ناموفق باشد، خطا برمی‌گردد نه silently ignore.
+	if echRaw := q.Get("ech"); echRaw != "" {
+		if _, err := decodeBase64Flexible(echRaw); err != nil {
+			return nil, fmt.Errorf("hysteria2: invalid ech config (expected base64 ECHConfigList): %v", err)
+		}
+		tlsObj["ech"] = map[string]interface{}{
+			"enabled": true,
+			"config":  []string{echRaw},
+		}
+	}
+
+	out := map[string]interface{}{
+		"type":        "hysteria2",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"password":    auth,
+		"tls":         tlsObj,
+	}
+
+	// 📌 obfs: طبق schema فعلی هدف (سینگ‌باکس Hysteria2)، تنها نوع obfs
+	// پشتیبانی‌شده "salamander" است. هر مقدار دیگری صراحتاً رد می‌شود —
+	// نه silently به یک outbound با obfs غیرمعتبر تبدیل می‌شود.
+	obfsType := q.Get("obfs")
+	obfsPass := q.Get("obfs-password")
+	switch obfsType {
+	case "":
+		if obfsPass != "" {
+			// obfs-password بدون obfs یک پارامتر معنادار است که silently
+			// drop نمی‌شود.
+			return nil, fmt.Errorf("hysteria2: obfs-password supplied without obfs type")
+		}
+	case "salamander":
+		obfs := map[string]interface{}{"type": obfsType}
+		if obfsPass != "" {
+			obfs["password"] = obfsPass
+		}
+		out["obfs"] = obfs
+	default:
+		return nil, fmt.Errorf("hysteria2: unsupported obfs type: %q", obfsType)
+	}
+
+	return out, nil
+}
+
+// buildWireGuardOutbound
+// ⚠️ فرمت wireguard:// استاندارد رسمی ندارد؛ این رایج‌ترین قرارداد
+// اکوسیستم است. اگر لینک‌های واقعی پروژه فرمت دیگری دارند، ممکن است
+// نیاز به تنظیم جزئی بعد از دیدن یک نمونه‌ی واقعی باشد.
+// wgValidateAddress یک آیتم مقدار address (CIDR مثل "10.0.0.2/32" یا
+// "fd00::2/128") را اعتبارسنجی می‌کند. طبق schema فعلی هدف سینگ‌باکس،
+// local_address باید CIDR notation معتبر باشد؛ یک IP بدون prefix هم
+// پذیرفته می‌شود (سینگ‌باکس خودش /32 یا /128 را فرض می‌کند).
+func wgValidateAddress(a string) (string, error) {
+	a = strings.TrimSpace(a)
+	if a == "" {
+		return "", fmt.Errorf("empty address entry")
+	}
+	if strings.Contains(a, "/") {
+		if _, _, err := net.ParseCIDR(a); err != nil {
+			return "", fmt.Errorf("invalid CIDR %q: %v", a, err)
+		}
+		return a, nil
+	}
+	if net.ParseIP(a) == nil {
+		return "", fmt.Errorf("invalid IP address %q", a)
+	}
+	return a, nil
+}
+
+func buildWireGuardOutbound(rawURI, tag string) (map[string]interface{}, error) {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(u.Scheme, "wireguard") && !strings.EqualFold(u.Scheme, "wg") {
+		return nil, fmt.Errorf("not a wireguard uri")
+	}
+	privateKey := u.User.Username()
+	if privateKey == "" {
+		return nil, fmt.Errorf("wireguard: missing private key")
+	}
+	host, port, err := splitHostPortFromURL(u)
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: %v", err)
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: invalid query parameters: %v", err)
+	}
+
+	publicKey := q.Get("publickey")
+	if publicKey == "" {
+		return nil, fmt.Errorf("wireguard: missing publickey")
+	}
+
+	out := map[string]interface{}{
+		"type":            "wireguard",
+		"tag":             tag,
+		"server":          host,
+		"server_port":     port,
+		"private_key":     privateKey,
+		"peer_public_key": publicKey,
+	}
+
+	if psk := q.Get("presharedkey"); psk != "" {
+		out["pre_shared_key"] = psk
+	}
+
+	// 📌 address/local_address اجباری است: طبق schema هدف، بدون آن یک
+	// WireGuard outbound ساختاراً ناقص و غیرقابل‌اتصال تولید می‌شود.
+	// مقدار نامعتبر/غیرقابل‌پردازش (نه فقط خالی) باید خطا ایجاد کند.
+	addr := q.Get("address")
+	if addr == "" {
+		return nil, fmt.Errorf("wireguard: missing address")
+	}
+	var addrs []string
+	for _, a := range strings.Split(addr, ",") {
+		validated, err := wgValidateAddress(a)
+		if err != nil {
+			return nil, fmt.Errorf("wireguard: address: %v", err)
+		}
+		addrs = append(addrs, validated)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("wireguard: address resolved to no valid entries")
+	}
+	out["local_address"] = addrs
+
+	if mtuRaw := q.Get("mtu"); mtuRaw != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(mtuRaw))
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("wireguard: invalid mtu: %q", mtuRaw)
+		}
+		out["mtu"] = n
+	}
+	if reserved := q.Get("reserved"); reserved != "" {
+		var nums []int
+		for _, rv := range strings.Split(reserved, ",") {
+			rv = strings.TrimSpace(rv)
+			if rv == "" {
+				return nil, fmt.Errorf("wireguard: invalid reserved entry (empty)")
+			}
+			n, err := strconv.Atoi(rv)
+			if err != nil || n < 0 || n > 255 {
+				return nil, fmt.Errorf("wireguard: invalid reserved entry: %q", rv)
+			}
+			nums = append(nums, n)
+		}
+		out["reserved"] = nums
+	}
+
+	return out, nil
+}
+
+// convertURIToSingBoxOutbound دیسپچر مرکزی: بر اساس scheme، یکی از توابع
+// build* را صدا می‌زند. هر خطای برگشتی از این تابع باعث fail-safe کامل
+// عملیات تزریق می‌شود (نه skip آن یک آیتم).
+func convertURIToSingBoxOutbound(uri, tag string) (map[string]interface{}, error) {
+	lower := strings.ToLower(strings.TrimSpace(uri))
+	switch {
+	case strings.HasPrefix(lower, "vless://"):
+		return buildVlessOutbound(uri, tag)
+	case strings.HasPrefix(lower, "vmess://"):
+		return buildVmessOutbound(uri, tag)
+	case strings.HasPrefix(lower, "trojan://"):
+		return buildTrojanOutbound(uri, tag)
+	case strings.HasPrefix(lower, "ss://"):
+		return buildShadowsocksOutbound(uri, tag)
+	case strings.HasPrefix(lower, "hysteria2://"), strings.HasPrefix(lower, "hy2://"):
+		return buildHysteria2Outbound(uri, tag)
+	case strings.HasPrefix(lower, "wireguard://"), strings.HasPrefix(lower, "wg://"):
+		return buildWireGuardOutbound(uri, tag)
+	default:
+		return nil, fmt.Errorf("unsupported scheme for sing-box conversion: %q", uri)
+	}
+}
+
+// injectExtraIntoSingBoxJSON تنها محل تزریق extraConfigs/هشدار داخل
+// JSON نیتیو سینگ‌باکس است.
+//
+// طراحی دو-فازی سخت‌گیرانه:
+//   - فاز ۱ (Validate): parse کامل JSON، اعتبارسنجی ساختار root/outbounds،
+//     اعتبارسنجی تمام outboundهای موجود (type assertion صریح روی هر عضو،
+//     نه صرفاً روی گروه هدف)، جمع‌آوری تگ‌های موجود، اعتبارسنجی و تبدیل
+//     تمام URIهای اضافی/هشدار، تولید تگ‌های جدید، و تشخیص هر نوع تصادم
+//     تگ. هیچ mutation‌ای در این فاز رخ نمی‌دهد.
+//   - فاز ۲ (Mutate): فقط بعد از موفقیت کامل فاز ۱، آرایه‌ی outbounds
+//     نهایی ساخته و گروه selector/urltest هدف (در صورت وجود) به‌روزرسانی
+//     می‌شود.
+//
+// Atomic Fail-Safe: هر شکستی در هر مرحله (parse، ساختار نامعتبر، assertion
+// ناموفق، URI نامعتبر، تصادم تگ، marshal ناموفق، یا panic) دقیقاً باعث
+// (nil, false) می‌شود — هرگز یک JSON نیمه‌تغییریافته برگردانده نمی‌شود و
+// هرگز یک URI نامعتبر به‌سادگی skip نمی‌شود؛ کل عملیات fail-closed است.
+// collectOutboundTagReferences تمام فیلدهای شناخته‌شده‌ی سینگ‌باکس که به یک
+// تگ outbound ارجاع می‌دهند را به‌صورت بازگشتی در سراسر سند JSON جمع‌آوری
+// می‌کند: "outbound" (مثلاً route.rules[*].outbound)، "detour" (در هر
+// outbound یا endpoint که می‌تواند از طریق outbound دیگری تونل بزند)،
+// "final" (مثلاً route.final)، "default" (پیش‌فرض یک گروه selector)، و هر
+// آرایه‌ی رشته‌ای تحت کلید "outbounds" (اعضای selector/urltest). طبق الزام
+// صریح، شناخت صریح فیلدهای سینگ‌باکس ترجیح دارد بر تفسیر هر رشته‌ی
+// دلخواه به‌عنوان reference؛ اگر schema های آینده فیلد جدیدی اضافه کنند،
+// باید اینجا اضافه شود. اگر مقدار هر یک از این کلیدهای شناخته‌شده از نوع
+// موردانتظار (رشته، یا آرایه‌ی رشته) نباشد، false برمی‌گرداند تا فراخواننده
+// عملیات را کاملاً fail-closed کند.
+func collectOutboundTagReferences(node interface{}, refs map[string]bool) bool {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key, val := range v {
+			switch key {
+			case "outbound", "detour", "final", "default":
+				s, isStr := val.(string)
+				if !isStr {
+					return false
+				}
+				if s != "" {
+					refs[s] = true
+				}
+			case "outbounds":
+				if arr, isArr := val.([]interface{}); isArr {
+					for _, item := range arr {
+						// اعضای رشته‌ای (selector/urltest) reference هستند؛ اعضای
+						// object (خودِ آرایه‌ی اصلی outbounds در ریشه‌ی سند) اینجا
+						// نادیده گرفته می‌شوند چون توسط حلقه‌ی type-safe موجود در
+						// فاز ۱ جداگانه و سخت‌گیرانه پردازش می‌شوند.
+						if s, isStr := item.(string); isStr && s != "" {
+							refs[s] = true
+						}
+					}
+				}
+			}
+			if !collectOutboundTagReferences(val, refs) {
+				return false
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if !collectOutboundTagReferences(item, refs) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func injectExtraIntoSingBoxJSON(body []byte, extraConfigs []string, warningCfg string) (out []byte, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[SingBoxInject] recovered panic: %v", r)
+			out, ok = nil, false
+		}
+	}()
+
+	// ============================================================
+	// فاز ۱: Validate — بدون هیچ mutation روی root/outbounds اصلی
+	// ============================================================
+
+	// 📌 اعتبارسنجی UTF-8 قبل از هرگونه parse: بدنه‌ای که ساختار JSON آن
+	// syntactically معتبر ولی حاوی بایت‌های نامعتبر UTF-8 باشد هم رد می‌شود.
+	if !utf8.Valid(body) {
+		return nil, false
+	}
+
+	// 📌 json.Decoder با UseNumber به‌جای json.Unmarshal مستقیم روی
+	// interface{}: اعداد صحیح بزرگ در float64 دقت خود را از دست می‌دهند
+	// (مثلاً یک عدد ۱۹ رقمی)؛ با UseNumber این مقادیر به‌صورت json.Number
+	// (رشته‌ی خام) نگه داشته می‌شوند و در marshal نهایی بدون تغییر بازتولید
+	// می‌شوند. dec.More() صراحتاً هر داده‌ی اضافی بعد از سند JSON کامل را رد
+	// می‌کند — دقیقاً همان سخت‌گیری‌ای که json.Unmarshal به‌صورت ضمنی داشت.
+	var root map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil {
+		return nil, false
+	}
+	if dec.More() {
+		return nil, false
+	}
+
+	rawOutbounds, exists := root["outbounds"]
+	if !exists {
+		return nil, false
+	}
+	outbounds, isArray := rawOutbounds.([]interface{})
+	if !isArray {
+		return nil, false
+	}
+
+	existingTags := make(map[string]bool, len(outbounds))
+	// reservedRefs: هر رشته‌ای که در هر جای سند به‌عنوان reference به یک تگ
+	// outbound شناخته می‌شود — چه داخل آرایه‌ی outbounds هر selector/urltest،
+	// چه route.final، چه route.rules[*].outbound، چه هر فیلد detour/default
+	// در هر نقطه از سند. این‌ها هم باید مثل تگ‌های واقعی از تصادم با تگ‌های
+	// تولیدی محافظت شوند، حتی اگر خودشان یک outbound موجود نباشند.
+	reservedRefs := make(map[string]bool)
+	if !collectOutboundTagReferences(root, reservedRefs) {
+		// یک فیلد شناخته‌شده‌ی reference (outbound/detour/final/default) با
+		// نوع غیرمنتظره (نه رشته) پیدا شد — نمی‌توانیم اثبات کنیم ادامه‌ی
+		// عملیات ایمن است؛ کل عملیات fail-closed می‌شود.
+		return nil, false
+	}
+	var targetGroupMap map[string]interface{}
+	var targetGroupExistingTags []interface{}
+
+	// 📌 هر outbound از نوع selector/urltest باید مستقل و کامل اعتبارسنجی
+	// شود — نه فقط اولین موردی که پیدا می‌شود. یک selector/urltest معیوب
+	// در هر نقطه‌ای از آرایه (حتی بعد از یک مورد معتبر) باعث fail-closed
+	// کامل می‌شود.
+	for _, ob := range outbounds {
+		obMap, isMap := ob.(map[string]interface{})
+		if !isMap {
+			// یک outbound موجود ساختار غیرمنتظره دارد — نمی‌توانیم اثبات کنیم
+			// دستکاری آن ایمن است؛ کل عملیات fail-closed می‌شود.
+			return nil, false
+		}
+
+		if tagRaw, hasTag := obMap["tag"]; hasTag {
+			tagStr, isStr := tagRaw.(string)
+			if !isStr {
+				return nil, false
+			}
+			existingTags[tagStr] = true
+		}
+
+		typeRaw, hasType := obMap["type"]
+		if !hasType {
+			continue
+		}
+		typeStr, isStr := typeRaw.(string)
+		if !isStr {
+			return nil, false
+		}
+		if typeStr != "selector" && typeStr != "urltest" {
+			continue
+		}
+
+		groupOutboundsRaw, hasGroupOutbounds := obMap["outbounds"]
+		if !hasGroupOutbounds {
+			return nil, false
+		}
+		groupOutbounds, isGroupArray := groupOutboundsRaw.([]interface{})
+		if !isGroupArray {
+			return nil, false
+		}
+		for _, gt := range groupOutbounds {
+			gtStr, isStr := gt.(string)
+			if !isStr {
+				return nil, false
+			}
+			reservedRefs[gtStr] = true
+		}
+
+		if targetGroupMap == nil {
+			targetGroupMap = obMap
+			targetGroupExistingTags = groupOutbounds
+		}
+	}
+
+	type injectItem struct {
+		uri string
+		tag string
+	}
+	var items []injectItem
+
+	warningCfg = strings.TrimSpace(warningCfg)
+	if warningCfg != "" {
+		items = append(items, injectItem{uri: warningCfg, tag: "agg-warning"})
+	}
+	extraIdx := 0
+	for _, cfg := range extraConfigs {
+		cfg = strings.TrimSpace(cfg)
+		if cfg == "" {
+			continue
+		}
+		extraIdx++
+		items = append(items, injectItem{uri: cfg, tag: fmt.Sprintf("agg-extra-%d", extraIdx)})
+	}
+
+	if len(items) == 0 {
+		return nil, false
+	}
+
+	generatedTagSet := make(map[string]bool, len(items))
+	var generatedOutbounds []interface{}
+	var generatedTags []string
+
+	for _, item := range items {
+		if existingTags[item.tag] || generatedTagSet[item.tag] || reservedRefs[item.tag] {
+			// تصادم تگ با کانفیگ موجود کاربر یا یک reference داخل
+			// selector/urltest — هرگز rename/overwrite نمی‌کنیم، کل
+			// عملیات fail-closed می‌شود.
+			return nil, false
+		}
+		outbound, err := convertURIToSingBoxOutbound(item.uri, item.tag)
+		if err != nil {
+			// یک URI نامعتبر هرگز باعث skip آن آیتم و ادامه‌ی بقیه نمی‌شود؛
+			// طبق الزام Atomic Fail-Safe کل عملیات fail-closed می‌شود.
+			log.Printf("[SingBoxInject] تبدیل کانفیگ به outbound ناموفق بود؛ عملیات کاملاً fail-safe شد: %v", err)
+			return nil, false
+		}
+		generatedTagSet[item.tag] = true
+		generatedOutbounds = append(generatedOutbounds, outbound)
+		generatedTags = append(generatedTags, item.tag)
+	}
+
+	// ============================================================
+	// فاز ۲: Mutate — فقط بعد از موفقیت کامل تمام اعتبارسنجی‌های فاز ۱
+	// ============================================================
+
+	newOutbounds := make([]interface{}, len(outbounds), len(outbounds)+len(generatedOutbounds))
+	copy(newOutbounds, outbounds)
+	newOutbounds = append(newOutbounds, generatedOutbounds...)
+	root["outbounds"] = newOutbounds
+
+	if targetGroupMap != nil {
+		newGroupOutbounds := make([]interface{}, len(targetGroupExistingTags), len(targetGroupExistingTags)+len(generatedTags))
+		copy(newGroupOutbounds, targetGroupExistingTags)
+		for _, tag := range generatedTags {
+			newGroupOutbounds = append(newGroupOutbounds, tag)
+		}
+		targetGroupMap["outbounds"] = newGroupOutbounds
+	}
+
+	final, err := json.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return final, true
+}
+
+// requestWantsJSONFormat کاملاً مستقل از detectClientApp (تله‌متری
+// داشبورد ادمین) است — فقط برای تصمیم‌گیری فرمت پاسخ استفاده می‌شود.
+func requestWantsJSONFormat(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ua := strings.ToLower(strings.TrimSpace(r.Header.Get("User-Agent")))
+	if ua == "" {
+		return false
+	}
+	markers := []string{"sing-box", "sfa", "sfi", "sfd", "sfm"}
+	for _, m := range markers {
+		if strings.Contains(ua, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// formatBlockResponse رفتار فعلی (text/plain) را برای غیر-JSON دقیقاً
+// حفظ می‌کند. برای کلاینت‌های سینگ‌باکس، blockConfig هرگز به‌عنوان یک
+// URI پروکسی parse/convert نمی‌شود — همیشه فقط یک outbound "direct"
+// ساده تولید می‌شود تا هیچ URI پروکسی/credential واقعی از طریق پیام
+// بلاک درز نکند.
+func formatBlockResponse(blockConfig string, wantsJSON bool) (contentType string, body []byte) {
+	blockConfig = strings.TrimSpace(blockConfig)
+	if blockConfig == "" {
+		blockConfig = "SUBSCRIPTION_BLOCKED"
+	}
+
+	if !wantsJSON {
+		return "text/plain; charset=utf-8", []byte(blockConfig)
+	}
+
+	// 📌 محافظت نشتی credential: در پاسخ JSON سخت‌گیرانه (کلاینت‌های
+	// سینگ‌باکس)، blockConfig هرگز به هیچ شکلی — کامل یا جزئی — در پاسخ
+	// نمایش داده نمی‌شود. قبلاً اینجا یک heuristic بر اساس وجود "://"
+	// بود که فقط URIهای پروکسی را فیلتر می‌کرد؛ آن heuristic حذف شده،
+	// چون blockConfig می‌تواند حاوی UUID/پسورد/توکن حتی بدون "://" هم
+	// باشد (مثلاً وقتی کاربر متن آزاد وارد کرده). پاسخ JSON همیشه و
+	// بدون قید و شرط دقیقاً همین رشته‌ی ثابت است.
+	const jsonBlockTag = "⛔ SUBSCRIPTION_BLOCKED"
+
+	outbound := map[string]interface{}{
+		"type": "direct",
+		"tag":  jsonBlockTag,
+	}
+	root := map[string]interface{}{
+		"outbounds": []interface{}{outbound},
+	}
+	final, err := json.Marshal(root)
+	if err != nil {
+		// 📌 حتی در این مسیر خطای بسیار بعید marshal، هرگز به fallback
+		// متنی حاوی blockConfig برنمی‌گردیم — کلاینت درخواست JSON کرده
+		// و باید فقط پیام ثابت و بی‌خطر را ببیند، نه یک fallback که
+		// می‌تواند secret را افشا کند.
+		return "application/json; charset=utf-8", []byte(`{"outbounds":[{"type":"direct","tag":"` + jsonBlockTag + `"}]}`)
+	}
+	return "application/json; charset=utf-8", final
+}
+
 func containsValidSubscriptionURI(text string) bool {
 	lines := strings.Split(text, "\n")
 	validProtocols := []string{"vless://", "vmess://", "ss://", "trojan://", "tuic://", "hysteria2://", "hysteria://", "wireguard://", "wg://", "tg://", "socks://", "http://"}
@@ -715,7 +2097,11 @@ func fetchAndCache() {
 			continue
 		}
 
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		// 📌 محدودسازی حافظه: یک لینک مادر upstream که پاسخ بسیار حجیمی
+		// برمی‌گرداند نباید کل حافظه‌ی پروسه را مصرف کند. طبق همان سقف و
+		// همان منطق fail-safe در handleSub/handleSubPasarGuard، بدنه‌ی
+		// بیش از حد مجاز کاملاً رد می‌شود (نه truncate و ادامه).
+		bodyBytes, readErr := readBoundedBody(resp.Body, maxUpstreamSubscriptionBodyBytes)
 		resp.Body.Close()
 		if readErr != nil {
 			log.Printf("[CronFetch] خطای خواندن پاسخ '%s': %v", l.Title, readErr)
@@ -1108,7 +2494,13 @@ func fetchPasarGuardUserInfoClassified(token string) (pgUserState, *pasarGuardUs
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	// 📌 محدودسازی حافظه: پاسخ /info یک آبجکت کوچک است؛ اگر upstream بیش از
+	// سقف مجاز پاسخ بدهد، این را یک شکست مبهم upstream در نظر می‌گیریم
+	// (نه پردازش یک بدنه‌ی بریده به‌عنوان اطلاعات معتبر کاربر).
+	body, bodyErr := readBoundedBody(resp.Body, maxUpstreamAPIBodyBytes)
+	if bodyErr != nil {
+		return classifyPasarGuardOutcome(resp.StatusCode, nil, nil)
+	}
 	if resp.StatusCode != 200 {
 		return classifyPasarGuardOutcome(resp.StatusCode, nil, nil)
 	}
@@ -1201,6 +2593,34 @@ func injectExtraIntoPasarGuardHTML(htmlStr string, extraConfigs []string) string
 }
 
 // 📌 Pipeline: PasarGuard Sub Handler
+// maxUpstreamSubscriptionBodyBytes سقف امن اندازه‌ی بدنه‌ی پاسخ upstream
+// (پنل PasarGuard/x-ui) که خوانده می‌شود — جلوگیری از تخصیص حافظه‌ی
+// نامحدود در صورت پاسخ upstream غیرمنتظره‌ی بسیار حجیم. اگر پاسخ از این
+// سقف فراتر رود، به‌جای تلاش برای JSON-parse یا decode یک سند ناقص/بریده،
+// همان مسیر خطای موجود («Subscription upstream error») برگردانده می‌شود.
+const maxUpstreamSubscriptionBodyBytes = 10 * 1024 * 1024 // 10 MiB
+
+// maxUpstreamAPIBodyBytes سقف امن برای پاسخ‌های API کوچک‌تر upstream
+// (PasarGuard /info، /api/groups/simple، /api/admin/token) — این پاسخ‌ها
+// طبق قرارداد باید JSON کوچک باشند؛ هر چیزی فراتر از این سقف مشکوک است و
+// به‌جای پردازش یک بدنه‌ی احتمالاً بریده، صریحاً fail می‌شود.
+const maxUpstreamAPIBodyBytes = 2 * 1024 * 1024 // 2 MiB
+
+// readBoundedBody یک io.Reader را حداکثر تا maxBytes می‌خواند و اگر بدنه
+// از این سقف فراتر رفته باشد (یعنی بایت اضافی +۱ هم موفق به خواندن شود)،
+// صریحاً خطا برمی‌گرداند — نه truncate خاموش و ادامه‌ی کار با یک بدنه‌ی
+// ناقص.
+func readBoundedBody(r io.Reader, maxBytes int64) ([]byte, error) {
+	limited, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(limited)) > maxBytes {
+		return nil, fmt.Errorf("response body exceeds max allowed size (%d bytes)", maxBytes)
+	}
+	return limited, nil
+}
+
 func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	setNoCacheHeaders(w)
 	if token == "" {
@@ -1214,13 +2634,10 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	// ============================================================
 	firewallDecision := FirewallCheck(r, token)
 	if !firewallDecision.Allow {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		ct, body := formatBlockResponse(firewallDecision.BlockConfig, requestWantsJSONFormat(r))
+		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(http.StatusOK)
-		blockConfig := strings.TrimSpace(firewallDecision.BlockConfig)
-		if blockConfig == "" {
-			blockConfig = "SUBSCRIPTION_BLOCKED"
-		}
-		_, _ = w.Write([]byte(blockConfig))
+		_, _ = w.Write(body)
 		return
 	}
 
@@ -1307,7 +2724,20 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 	consumed = true
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	// 📌 محدودسازی اندازه‌ی خواندن بدنه: اگر پاسخ upstream بیش از سقف مجاز
+	// باشد، به‌جای پردازش یک بدنه‌ی بریده/ناقص (که می‌تواند JSON نامعتبر یا
+	// base64 نیمه‌کاره تولید کند)، صریحاً fail می‌شویم — نه truncate خاموش.
+	bodyBytes, bodyErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamSubscriptionBodyBytes+1))
+	if bodyErr != nil {
+		log.Printf("[PasarGuard] خواندن پاسخ upstream ناموفق بود: %v", bodyErr)
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
+	if len(bodyBytes) > maxUpstreamSubscriptionBodyBytes {
+		log.Printf("[PasarGuard] پاسخ upstream بیش از سقف مجاز (%d بایت) بود؛ رد شد", len(bodyBytes))
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
 	debugSubscriptionResponse("PasarGuard", r, resp, bodyBytes)
 
 	if resp.StatusCode != 200 {
@@ -1359,6 +2789,20 @@ func handleSubPasarGuard(w http.ResponseWriter, r *http.Request, token string) {
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(resp.StatusCode)
 		w.Write([]byte(injectExtraIntoPasarGuardHTML(string(bodyBytes), htmlExtraConfigs)))
+		return
+	}
+
+	if looksLikeJSONResponse(bodyBytes, ct) {
+		if injected, ok := injectExtraIntoSingBoxJSON(bodyBytes, extraConfigs, warningCfg); ok {
+			bodyBytes = injected
+		}
+		if ct == "" {
+			ct = "application/json; charset=utf-8"
+		}
+		copySubscriptionHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(bodyBytes)
 		return
 	}
 
@@ -1445,7 +2889,10 @@ func getPasarGuardAdminToken(forceRefresh bool) string {
 		if resp.StatusCode != 200 {
 			return "", nil
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, bodyErr := readBoundedBody(resp.Body, maxUpstreamAPIBodyBytes)
+		if bodyErr != nil {
+			return "", nil
+		}
 		var tok struct {
 			AccessToken string `json:"access_token"`
 		}
@@ -1504,7 +2951,10 @@ func getPasarGuardGroups() []pgGroupSimple {
 		return nil
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, bodyErr := readBoundedBody(resp.Body, maxUpstreamAPIBodyBytes)
+	if bodyErr != nil {
+		return nil
+	}
 	var parsed struct {
 		Groups []pgGroupSimple `json:"groups"`
 	}
@@ -2880,19 +4330,24 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	// ============================================================
 	firewallDecision := FirewallCheck(r, subID)
 	if !firewallDecision.Allow {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		ct, body := formatBlockResponse(firewallDecision.BlockConfig, requestWantsJSONFormat(r))
+		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(http.StatusOK)
-		blockConfig := strings.TrimSpace(firewallDecision.BlockConfig)
-		if blockConfig == "" {
-			blockConfig = "SUBSCRIPTION_BLOCKED"
-		}
-		_, _ = w.Write([]byte(blockConfig))
+		_, _ = w.Write(body)
 		return
 	}
 
 	cfg := getXUIConfig()
 	sanaeiURL := fmt.Sprintf("https://127.0.0.1:%s%s%s", cfg.Port, cfg.Path, subID)
-	req, _ := http.NewRequest("GET", sanaeiURL, nil)
+	// 📌 خطای NewRequest دیگر نادیده گرفته نمی‌شود: نادیده‌گرفتن آن یعنی
+	// دسترسی به req نامعتبر (nil) در ادامه‌ی تابع (nil-pointer panic روی
+	// req.Header). مسیر موفق کاملاً بدون تغییر باقی می‌ماند.
+	req, reqErr := http.NewRequest("GET", sanaeiURL, nil)
+	if reqErr != nil {
+		log.Printf("[XUI] ساخت درخواست upstream ناموفق بود: %v", reqErr)
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
 
 	wantsHTML := strings.Contains(r.Header.Get("Accept"), "text/html") || r.URL.Query().Get("html") == "1"
 
@@ -2929,7 +4384,20 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	// 📌 محدودسازی اندازه‌ی خواندن بدنه (همان سقف و همان منطق fail-safe
+	// استفاده‌شده در handleSubPasarGuard): یک بدنه‌ی بریده/ناقص هرگز
+	// به‌عنوان ساب‌اسکریپشن کامل پردازش نمی‌شود.
+	bodyBytes, bodyErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamSubscriptionBodyBytes+1))
+	if bodyErr != nil {
+		log.Printf("[XUI] خواندن پاسخ upstream ناموفق بود: %v", bodyErr)
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
+	if len(bodyBytes) > maxUpstreamSubscriptionBodyBytes {
+		log.Printf("[XUI] پاسخ upstream بیش از سقف مجاز (%d بایت) بود؛ رد شد", len(bodyBytes))
+		http.Error(w, "Subscription upstream error", http.StatusBadGateway)
+		return
+	}
 	debugSubscriptionResponse("x-ui", r, resp, bodyBytes)
 
 	if resp.StatusCode != 200 {
@@ -2962,6 +4430,20 @@ func handleSub(w http.ResponseWriter, r *http.Request, subID string) {
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(resp.StatusCode)
 		w.Write([]byte(injectExtraIntoSanaeiHTML(string(bodyBytes), htmlExtraConfigs)))
+		return
+	}
+
+	if looksLikeJSONResponse(bodyBytes, ct) {
+		if injected, ok := injectExtraIntoSingBoxJSON(bodyBytes, extraConfigs, warningCfg); ok {
+			bodyBytes = injected
+		}
+		if ct == "" {
+			ct = "application/json; charset=utf-8"
+		}
+		copySubscriptionHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(bodyBytes)
 		return
 	}
 
