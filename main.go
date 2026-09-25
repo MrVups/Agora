@@ -546,14 +546,13 @@ func looksLikeJSONResponse(body []byte, contentType string) bool {
 	if strings.Contains(strings.ToLower(contentType), "application/json") {
 		return true
 	}
-	trimmed := strings.TrimSpace(string(body))
+
+	trimmed := strings.TrimSpace(strings.TrimPrefix(string(body), "\xef\xbb\xbf"))
 	if trimmed == "" {
 		return false
 	}
-	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
-		return false
-	}
-	return json.Valid(body)
+
+	return strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
 }
 
 // decodeBase64Flexible چند حالت رایج base64 (استاندارد/URL-safe،
@@ -1666,6 +1665,7 @@ func injectExtraIntoSingBoxJSON(body []byte, extraConfigs []string, warningCfg s
 			out, ok = nil, false
 		}
 	}()
+	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 
 	// ============================================================
 	// فاز ۱: Validate — بدون هیچ mutation روی root/outbounds اصلی
